@@ -14,6 +14,10 @@
 //!     --quic fake             QUIC (HTTP/3): fake, drop (браузер уйдёт на TCP), pass
 //!     --discord-voice         фейки перед голосом Discord (по умолчанию голос не трогается)
 //!     --check                 только проверить параметры и фильтр, без перехвата
+//!     --auto                  автоподбор: свой приём для каждого сайта, при сбоях — следующий (--split/--fooling
+//!                             и т. п. тогда не действуют); выбор хранится в data\tuning.txt рядом с vx.exe
+//!     --auto-test             то же, но все сайты начинают «без приёмов» и файл не читается — проверка, что
+//!                             заблокированный сайт сам переходит на рабочий приём
 //!     --doh cloudflare        DNS через DNS-over-HTTPS: cloudflare, google, quad9 или https://…; если DoH не ответил —
 //!                             запрос уходит обычному DNS как раньше
 //!
@@ -31,6 +35,8 @@ use std::time::{Duration, Instant};
 use vx_core::desync::corrupt_tcp_checksum;
 use vx_core::{Action, Fooling, Proto, QuicMode, SplitPos, Strategy, Transport, apply, classify, parse};
 use vx_core::dns;
+use vx_core::packet::TCP_RST;
+use vx_core::tuner::{Event, Tracker, Tuner, passthrough, presets, site_key};
 use vx_divert::{Divert, FLAG_SNIFF};
 use vx_doh::Doh;
 
@@ -198,6 +204,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let filter = run_filter(&strategy);
     vx_divert::check_filter(&dir, &filter).map_err(|e| e.to_string())?;
     vx_divert::check_filter(&dir, DNS_FILTER).map_err(|e| e.to_string())?;
+    vx_divert::check_filter(&dir, INBOUND_FILTER).map_err(|e| e.to_string())?;
     let doh = option(args, "--doh").map(|p| Doh::new(&p).map_err(|e| e.to_string())).transpose()?;
     if args.iter().any(|a| a == "--check") {
         println!("Фильтр и приёмы в порядке: {strategy:?}");
@@ -211,13 +218,22 @@ fn run(args: &[String]) -> Result<(), String> {
         println!("DNS: через DoH {}, при сбое — обычный DNS.", stats.server);
     }
 
+    let auto = if args.iter().any(|a| a == "--auto" || a == "--auto-test") {
+        let auto = Auto::start(&dir, &strategy, args.iter().any(|a| a == "--auto-test"))?;
+        println!("Автоподбор: для каждого сайта свой приём, при сбоях — следующий; выбор хранится в {}.", auto.file.display());
+        Some(auto)
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let mut seen: HashSet<String> = HashSet::new();
     let (mut changed, mut passed, mut dropped, mut send_errors) = (0u64, 0u64, 0u64, 0u64);
     let mut buf = vec![0u8; 0xffff];
     while let Ok((len, addr)) = divert.recv(&mut buf) {
         let packet = &buf[..len];
-        let result = match apply(packet, &strategy) {
+        let chosen = auto.as_ref().and_then(|a| a.pick(packet));
+        let result = match apply(packet, chosen.map_or(&strategy, |i| &auto.as_ref().expect("есть").strategies[i])) {
             Action::Pass => {
                 passed += 1;
                 divert.send(packet, &addr)
@@ -249,6 +265,9 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
     println!("Готово: изменено {changed}, пропущено {passed}, отброшено QUIC {dropped}, ошибок отправки {send_errors}.");
+    if let Some(auto) = auto {
+        let _ = auto.inbound.shutdown();
+    }
     if let Some((dns_divert, stats)) = dns {
         let _ = dns_divert.shutdown();
         println!(
@@ -258,6 +277,108 @@ fn run(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Ответы серверов на соединения с приёмами: ServerHello (успех) или RST (сброс, обычно от DPI). Только копии.
+const INBOUND_FILTER: &str = "inbound and !loopback and tcp.SrcPort == 443 and \
+    ((tcp.PayloadLength > 5 and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x02) or tcp.Rst)";
+
+/// Сколько ждать ServerHello, прежде чем считать соединение неудачным.
+const ANSWER_TIMEOUT_MS: u64 = 5000;
+
+/// Автоподбор: приём для сайта выбирает `Tuner`; ответы серверов (копии входящих пакетов) и тайм-ауты сообщают,
+/// сработал ли он. Выбор сохраняется в data\tuning.txt рядом с vx.exe.
+struct Auto {
+    names: Vec<&'static str>,
+    strategies: Vec<Strategy>,
+    state: Arc<std::sync::Mutex<(Tuner, Tracker)>>,
+    inbound: Arc<Divert>,
+    file: PathBuf,
+    started: Instant,
+}
+
+impl Auto {
+    fn start(dir: &std::path::Path, global: &Strategy, test: bool) -> Result<Self, String> {
+        let mut list = presets();
+        if test {
+            list.insert(0, ("без приёмов", passthrough()));
+        }
+        // QUIC и голос Discord — общие настройки из командной строки, автоподбор меняет только приёмы для TLS.
+        let strategies: Vec<Strategy> = list
+            .iter()
+            .map(|(_, s)| Strategy { quic: global.quic, discord_voice: global.discord_voice, ..s.clone() })
+            .collect();
+        let names: Vec<&'static str> = list.iter().map(|(n, _)| *n).collect();
+        let file = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("data").join("tuning.txt");
+        let mut tuner = Tuner::new(names.len(), 0);
+        if !test && let Ok(text) = std::fs::read_to_string(&file) {
+            tuner.load(&text, &names);
+        }
+        let state = Arc::new(std::sync::Mutex::new((tuner, Tracker::default())));
+        let inbound = Arc::new(Divert::open(dir, INBOUND_FILTER, 0, FLAG_SNIFF).map_err(|e| e.to_string())?);
+        let auto = Self { names, strategies, state, inbound, file, started: Instant::now() };
+        auto.watch();
+        Ok(auto)
+    }
+
+    fn now_ms(started: Instant) -> u64 {
+        started.elapsed().as_millis() as u64
+    }
+
+    /// Приём для исходящего ClientHello; соединение запоминается до ответа сервера.
+    fn pick(&self, packet: &[u8]) -> Option<usize> {
+        let pkt = parse(packet)?;
+        let (Transport::Tcp(tcp), Some(Proto::Tls { host, .. })) = (pkt.transport, classify(&pkt)) else { return None };
+        let site = site_key(host);
+        let mut state = self.state.lock().ok()?;
+        let choice = state.0.choice(&site);
+        state.1.sent((pkt.src, tcp.src_port, pkt.dst, tcp.dst_port), site, choice, Self::now_ms(self.started));
+        Some(choice)
+    }
+
+    /// Поток ответов серверов и поток тайм-аутов.
+    fn watch(&self) {
+        let names = self.names.clone();
+        let file = self.file.clone();
+        let report = move |state: &mut (Tuner, Tracker), site: String, strategy: usize, ok: bool| {
+            let Some(event) = state.0.report(&site, strategy, ok) else { return };
+            match event {
+                Event::Works { site, strategy } => println!("  {site}: работает с «{}»", names[strategy]),
+                Event::Switched { site, from, to } => {
+                    println!("  {site}: не открывается с «{}» → пробую «{}»", names[from], names[to])
+                }
+            }
+            // Ошибка записи не мешает обходу: выбор просто не сохранится до следующего запуска.
+            let _ = std::fs::create_dir_all(file.parent().unwrap_or(&file))
+                .and_then(|_| std::fs::write(&file, state.0.save(&names)));
+        };
+        let report = Arc::new(report);
+
+        let (inbound, state, rep) = (Arc::clone(&self.inbound), Arc::clone(&self.state), Arc::clone(&report));
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 0xffff];
+            while let Ok((len, _)) = inbound.recv(&mut buf) {
+                let Some(pkt) = parse(&buf[..len]) else { continue };
+                let Transport::Tcp(tcp) = pkt.transport else { continue };
+                let ok = tcp.flags & TCP_RST == 0;
+                let Ok(mut s) = state.lock() else { break };
+                if let Some((site, strategy, ok)) = s.1.answered((pkt.dst, tcp.dst_port, pkt.src, tcp.src_port), ok) {
+                    rep(&mut s, site, strategy, ok);
+                }
+            }
+        });
+
+        let (state, rep, started) = (Arc::clone(&self.state), report, self.started);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let Ok(mut s) = state.lock() else { break };
+                for (site, strategy) in s.1.expired(Self::now_ms(started), ANSWER_TIMEOUT_MS) {
+                    rep(&mut s, site, strategy, false);
+                }
+            }
+        });
+    }
 }
 
 /// Исходящие DNS-запросы (UDP 53). Ответы подставляет `start_doh`.

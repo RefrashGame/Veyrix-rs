@@ -4,6 +4,7 @@ pub mod desync;
 pub mod dns;
 pub mod packet;
 pub mod proto;
+pub mod tuner;
 
 pub use desync::{Action, Fooling, QuicMode, SplitPos, Strategy, apply};
 pub use packet::{Packet, TcpHeader, Transport, UdpHeader, parse};

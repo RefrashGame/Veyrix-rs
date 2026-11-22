@@ -39,6 +39,16 @@ target\release\vx.exe run                  # по умолчанию: фейк (
 Параметры приёмов — в начале `crates/cli/src/main.rs` (`--split`, `--fooling`, `--repeats`, `--quic`,
 `--no-fake`, `--no-disorder`, `--discord-voice`).
 
+## Автоподбор
+
+```powershell
+target\release\vx.exe run --auto --doh cloudflare   # свой приём для каждого сайта, при сбоях — следующий
+target\release\vx.exe run --auto-test               # все сайты начинают «без приёмов»: видно, как заблокированные переключаются
+```
+
+В консоли: «сайт: работает с «приём»» и «сайт: не открывается с «A» → пробую «B»». Выбор — `data\tuning.txt`
+рядом с `vx.exe` (`--auto-test` его не читает, но перезаписывает).
+
 ## DNS-over-HTTPS
 
 ```powershell
