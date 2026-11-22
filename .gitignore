@@ -1,0 +1,5 @@
+/target/
+# Драйвер и библиотека WinDivert не хранятся в git: см. docs/DEVELOPMENT.md
+/engine/
+*.sys
+*.dll
