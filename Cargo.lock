@@ -8,6 +8,7 @@ version = "0.0.1"
 dependencies = [
  "vx-core",
  "vx-divert",
+ "vx-doh",
 ]
 
 [[package]]
@@ -16,4 +17,8 @@ version = "0.0.1"
 
 [[package]]
 name = "vx-divert"
+version = "0.0.1"
+
+[[package]]
+name = "vx-doh"
 version = "0.0.1"

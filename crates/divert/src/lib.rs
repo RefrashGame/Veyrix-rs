@@ -39,6 +39,11 @@ impl Address {
     pub fn outbound(&self) -> bool {
         self.bits & Self::OUTBOUND != 0
     }
+    /// Направление при отправке: `false` — пакет придёт программам этого компьютера как входящий
+    /// (на том же интерфейсе, с которого был перехвачен исходный).
+    pub fn set_outbound(&mut self, outbound: bool) {
+        if outbound { self.bits |= Self::OUTBOUND } else { self.bits &= !Self::OUTBOUND }
+    }
     pub fn loopback(&self) -> bool {
         self.bits & Self::LOOPBACK != 0
     }

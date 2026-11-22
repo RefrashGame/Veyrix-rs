@@ -9,3 +9,4 @@ publish.workspace = true
 [dependencies]
 vx-core = { path = "../core" }
 vx-divert = { path = "../divert" }
+vx-doh = { path = "../doh" }

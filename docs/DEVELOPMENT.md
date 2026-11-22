@@ -38,3 +38,14 @@ target\release\vx.exe run                  # по умолчанию: фейк (
 в программу не попадает. Ctrl+C или закрытие окна — драйвер сразу пускает всё напрямую.
 Параметры приёмов — в начале `crates/cli/src/main.rs` (`--split`, `--fooling`, `--repeats`, `--quic`,
 `--no-fake`, `--no-disorder`, `--discord-voice`).
+
+## DNS-over-HTTPS
+
+```powershell
+target\release\vx.exe doh youtube.com --doh quad9   # проверка DoH без перехвата, прав администратора не нужно
+target\release\vx.exe run --doh cloudflare          # обход + DNS через DoH (cloudflare, google, quad9, https://…)
+```
+
+Системные настройки DNS не меняются: запросы на UDP 53 перехватываются, ответ от DoH подставляется входящим
+пакетом. Если DoH не ответил (≈ 3 с) — исходный запрос уходит обычному DNS. Проверка подмены: `nslookup сайт`
+во время работы — адреса должны совпасть с `vx doh сайт`.

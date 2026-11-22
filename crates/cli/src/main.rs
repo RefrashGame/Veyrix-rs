@@ -14,17 +14,25 @@
 //!     --quic fake             QUIC (HTTP/3): fake, drop (браузер уйдёт на TCP), pass
 //!     --discord-voice         фейки перед голосом Discord (по умолчанию голос не трогается)
 //!     --check                 только проверить параметры и фильтр, без перехвата
+//!     --doh cloudflare        DNS через DNS-over-HTTPS: cloudflare, google, quad9 или https://…; если DoH не ответил —
+//!                             запрос уходит обычному DNS как раньше
+//!
+//! vx doh ИМЯ [--doh cloudflare]
+//!     Проверка DoH без перехвата: адреса сайта через DNS-over-HTTPS.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use vx_core::desync::corrupt_tcp_checksum;
 use vx_core::{Action, Fooling, Proto, QuicMode, SplitPos, Strategy, Transport, apply, classify, parse};
+use vx_core::dns;
 use vx_divert::{Divert, FLAG_SNIFF};
+use vx_doh::Doh;
 
 /// Только исходящие пакеты с данными на порты, которые разбираем; в ядре, чтобы не копировать весь трафик.
 const SNIFF_FILTER: &str = "outbound and !loopback and !impostor and (\
@@ -37,6 +45,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("sniff") => sniff(&args[1..]),
         Some("run") => run(&args[1..]),
+        Some("doh") => doh_test(&args[1..]),
         _ => {
             eprintln!("Использование: vx sniff | vx run [приёмы] — подробности в docs/DEVELOPMENT.md");
             return ExitCode::from(2);
@@ -188,13 +197,19 @@ fn run(args: &[String]) -> Result<(), String> {
     let dir = engine_dir(args).map_err(|e| e.to_string())?;
     let filter = run_filter(&strategy);
     vx_divert::check_filter(&dir, &filter).map_err(|e| e.to_string())?;
+    vx_divert::check_filter(&dir, DNS_FILTER).map_err(|e| e.to_string())?;
+    let doh = option(args, "--doh").map(|p| Doh::new(&p).map_err(|e| e.to_string())).transpose()?;
     if args.iter().any(|a| a == "--check") {
         println!("Фильтр и приёмы в порядке: {strategy:?}");
         return Ok(());
     }
     let divert = Arc::new(Divert::open(&dir, &filter, 0, 0).map_err(|e| e.to_string())?);
+    let dns = doh.map(|d| start_doh(&dir, d)).transpose()?;
     println!("Обход запущен, {}.", stop_after(&divert, seconds));
     println!("Приёмы: {strategy:?}");
+    if let Some((_, stats)) = &dns {
+        println!("DNS: через DoH {}, при сбое — обычный DNS.", stats.server);
+    }
 
     let started = Instant::now();
     let mut seen: HashSet<String> = HashSet::new();
@@ -234,6 +249,100 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
     println!("Готово: изменено {changed}, пропущено {passed}, отброшено QUIC {dropped}, ошибок отправки {send_errors}.");
+    if let Some((dns_divert, stats)) = dns {
+        let _ = dns_divert.shutdown();
+        println!(
+            "DNS: через DoH {}, обычным DNS (DoH не ответил) {}.",
+            stats.via_doh.load(Ordering::Relaxed),
+            stats.fallback.load(Ordering::Relaxed)
+        );
+    }
+    Ok(())
+}
+
+/// Исходящие DNS-запросы (UDP 53). Ответы подставляет `start_doh`.
+const DNS_FILTER: &str = "outbound and !loopback and !impostor and udp.DstPort == 53";
+
+struct DnsStats {
+    server: String,
+    via_doh: AtomicU64,
+    fallback: AtomicU64,
+}
+
+/// Перехват DNS: запрос → DoH → ответ подставляется входящим пакетом. Если DoH не ответил или ответил не тем —
+/// исходный запрос отправляется дальше без изменений, и сайт откроется через обычный DNS, как без программы.
+fn start_doh(dir: &std::path::Path, doh: Doh) -> Result<(Arc<Divert>, Arc<DnsStats>), String> {
+    let divert = Arc::new(Divert::open(dir, DNS_FILTER, 0, 0).map_err(|e| e.to_string())?);
+    let stats = Arc::new(DnsStats { server: doh.host.clone(), via_doh: AtomicU64::new(0), fallback: AtomicU64::new(0) });
+    let doh = Arc::new(doh);
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, vx_divert::Address)>();
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+
+    // Несколько запросов параллельно: один медленный ответ не задерживает остальные.
+    for _ in 0..8 {
+        let (divert, doh, stats, rx) = (Arc::clone(&divert), Arc::clone(&doh), Arc::clone(&stats), Arc::clone(&rx));
+        std::thread::spawn(move || {
+            while let Ok((packet, addr)) = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ())) {
+                match resolve(&doh, &packet) {
+                    Some(reply) => {
+                        let mut reply = reply;
+                        let mut a = addr;
+                        a.set_outbound(false);
+                        divert.calc_checksums(&mut reply, &mut a);
+                        if divert.send(&reply, &a).is_ok() {
+                            stats.via_doh.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        stats.fallback.fetch_add(1, Ordering::Relaxed);
+                        let _ = divert.send(&packet, &addr);
+                    }
+                    None => {
+                        stats.fallback.fetch_add(1, Ordering::Relaxed);
+                        let _ = divert.send(&packet, &addr);
+                    }
+                }
+            }
+        });
+    }
+
+    let reader = Arc::clone(&divert);
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 0xffff];
+        while let Ok((len, addr)) = reader.recv(&mut buf) {
+            if tx.send((buf[..len].to_vec(), addr)).is_err() {
+                break;
+            }
+        }
+    });
+    Ok((divert, stats))
+}
+
+/// Ответный пакет из DoH или `None`, если запрос не наш (сам DoH-сервер), DoH не ответил или ответил не на то.
+fn resolve(doh: &Doh, packet: &[u8]) -> Option<Vec<u8>> {
+    let pkt = parse(packet)?;
+    let (name, _) = dns::question(pkt.payload)?;
+    if name == doh.host {
+        return None;
+    }
+    let answer = doh.query(pkt.payload).ok()?;
+    dns::is_answer_to(pkt.payload, &answer).then(|| dns::reply_packet(&pkt, &answer)).flatten()
+}
+
+fn doh_test(args: &[String]) -> Result<(), String> {
+    let name = args.first().filter(|a| !a.starts_with("--")).ok_or("Использование: vx doh ИМЯ [--doh cloudflare]")?;
+    let provider = option(args, "--doh").unwrap_or_else(|| "cloudflare".into());
+    let doh = Doh::new(&provider).map_err(|e| e.to_string())?;
+    for (kind, qtype) in [("A", dns::TYPE_A), ("AAAA", dns::TYPE_AAAA)] {
+        let query = dns::build_query(0x5678, name, qtype);
+        let started = Instant::now();
+        let answer = doh.query(&query).map_err(|e| e.to_string())?;
+        if !dns::is_answer_to(&query, &answer) {
+            return Err(format!("{provider}: ответ не на этот запрос"));
+        }
+        let list: Vec<String> = dns::addresses(&answer).iter().map(ToString::to_string).collect();
+        println!("{kind:<4} {name} через {} за {} мс: {}", doh.host, started.elapsed().as_millis(),
+            if list.is_empty() { "нет записей".into() } else { list.join(", ") });
+    }
     Ok(())
 }
 
