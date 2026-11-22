@@ -64,6 +64,7 @@ struct Api {
     shutdown: unsafe extern "C" fn(Handle, u32) -> i32,
     close: unsafe extern "C" fn(Handle) -> i32,
     calc_checksums: unsafe extern "C" fn(*mut c_void, u32, *mut Address, u64) -> i32,
+    compile_filter: unsafe extern "C" fn(*const i8, u32, *mut i8, u32, *mut *const i8, *mut u32) -> i32,
 }
 
 #[link(name = "kernel32", kind = "raw-dylib")]
@@ -110,9 +111,25 @@ fn load(dll_dir: &Path) -> io::Result<&'static Api> {
             shutdown: cast(sym(b"WinDivertShutdown\0")?),
             close: cast(sym(b"WinDivertClose\0")?),
             calc_checksums: cast(sym(b"WinDivertHelperCalcChecksums\0")?),
+            compile_filter: cast(sym(b"WinDivertHelperCompileFilter\0")?),
         }
     };
     Ok(API.get_or_init(|| api))
+}
+
+/// Проверяет синтаксис фильтра без драйвера и без перехвата (прав администратора не нужно).
+pub fn check_filter(dll_dir: &Path, filter: &str) -> io::Result<()> {
+    let api = load(dll_dir)?;
+    let c = CString::new(filter).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "нулевой байт в фильтре"))?;
+    let mut error: *const i8 = std::ptr::null();
+    let mut pos = 0u32;
+    // SAFETY: строка фильтра живёт до конца вызова; объект не нужен (null, 0).
+    if unsafe { (api.compile_filter)(c.as_ptr(), LAYER_NETWORK, std::ptr::null_mut(), 0, &mut error, &mut pos) } != 0 {
+        return Ok(());
+    }
+    // SAFETY: WinDivert возвращает статическую строку с ошибкой или null.
+    let what = if error.is_null() { "?".into() } else { unsafe { std::ffi::CStr::from_ptr(error) }.to_string_lossy() };
+    Err(io::Error::new(io::ErrorKind::InvalidInput, format!("фильтр WinDivert: {what} (позиция {pos})")))
 }
 
 /// Открытый перехват WinDivert. Закрывается при удалении — тогда весь трафик сразу идёт напрямую.

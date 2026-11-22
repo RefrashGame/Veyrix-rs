@@ -111,32 +111,7 @@ mod tests {
     use super::*;
     use crate::packet::{TCP_ACK, TCP_PSH, parse, tests::ipv4_tcp};
 
-    /// Минимальный корректный ClientHello: другое расширение, затем server_name.
-    pub fn client_hello(host: &str) -> Vec<u8> {
-        let mut ext = vec![0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]; // ec_point_formats
-        let name = host.as_bytes();
-        ext.extend([0x00, 0x00]);
-        ext.extend(((name.len() + 5) as u16).to_be_bytes());
-        ext.extend(((name.len() + 3) as u16).to_be_bytes());
-        ext.push(0);
-        ext.extend((name.len() as u16).to_be_bytes());
-        ext.extend(name);
-
-        let mut body = vec![0x03, 0x03];
-        body.extend([0x11; 32]);
-        body.extend([32].iter().chain(&[0x22; 32])); // session id
-        body.extend([0x00, 0x04, 0x13, 0x01, 0x13, 0x02]);
-        body.extend([0x01, 0x00]);
-        body.extend((ext.len() as u16).to_be_bytes());
-        body.extend(ext);
-
-        let mut hs = vec![0x01, 0, (body.len() >> 8) as u8, body.len() as u8];
-        hs.extend(body);
-        let mut rec = vec![0x16, 0x03, 0x01];
-        rec.extend((hs.len() as u16).to_be_bytes());
-        rec.extend(hs);
-        rec
-    }
+    use crate::desync::fake_tls_hello as client_hello;
 
     #[test]
     fn sni_and_its_offset() {
