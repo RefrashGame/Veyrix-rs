@@ -39,6 +39,23 @@ target\release\vx.exe run                  # по умолчанию: фейк (
 Параметры приёмов — в начале `crates/cli/src/main.rs` (`--split`, `--fooling`, `--repeats`, `--quic`,
 `--no-fake`, `--no-disorder`, `--discord-voice`).
 
+## Окно (Tauri)
+
+Интерфейс — `app/` (React + shadcn, bun), нативная часть — `app/src-tauri` (крейт `veyrix`, участник workspace,
+ходит в `vx-engine`). Окно просит права администратора при запуске (манифест `app/src-tauri/veyrix.manifest` —
+только ASCII, иначе Windows не запускает exe с ошибкой 14001).
+
+```powershell
+cd app
+bun install                          # один раз
+bun run tauri dev                    # разработка; терминал — от администратора
+bun run tauri build --no-bundle      # target\release\veyrix.exe с встроенным интерфейсом
+```
+
+WinDivert для окна ищется так же, как для `vx`: `engine\` рядом с `veyrix.exe`, иначе рядом с ним.
+Настройки окна — `data\settings.json` рядом с exe. Версии Tauri в `app/src-tauri/Cargo.toml` и `app/package.json`
+должны совпадать по major.minor (`tauri build` проверяет).
+
 ## Автоподбор
 
 ```powershell

@@ -10,3 +10,4 @@ publish.workspace = true
 vx-core = { path = "../core" }
 vx-divert = { path = "../divert" }
 vx-doh = { path = "../doh" }
+vx-engine = { path = "../engine" }

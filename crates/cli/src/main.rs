@@ -29,16 +29,13 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use vx_core::desync::corrupt_tcp_checksum;
-use vx_core::{Action, Fooling, Proto, QuicMode, SplitPos, Strategy, Transport, apply, classify, parse};
 use vx_core::dns;
-use vx_core::packet::{TCP_FIN, TCP_RST};
-use vx_core::tuner::{Event, Tracker, Tuner, passthrough, presets, site_key};
+use vx_core::{Fooling, Proto, QuicMode, SplitPos, Strategy, Transport, classify, parse};
 use vx_divert::{Divert, FLAG_SNIFF};
 use vx_doh::Doh;
+use vx_engine::{Config, Engine, Event as EngineEvent};
 
 /// Только исходящие пакеты с данными на порты, которые разбираем; в ядре, чтобы не копировать весь трафик.
 const SNIFF_FILTER: &str = "outbound and !loopback and !impostor and (\
@@ -179,285 +176,56 @@ fn parse_strategy(args: &[String]) -> Result<Strategy, String> {
     Ok(s)
 }
 
-/// Фильтр в ядре: только первые пакеты, которые приёмы меняют. Весь остальной трафик в программу не попадает.
-fn run_filter(s: &Strategy) -> String {
-    let mut parts = vec![
-        "(tcp.DstPort == 443 and tcp.PayloadLength > 5 and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x01)",
-        "(tcp.DstPort == 80 and tcp.PayloadLength > 0)",
-    ];
-    if s.quic != QuicMode::Pass {
-        parts.push("(udp.DstPort == 443 and udp.PayloadLength >= 1200)");
-    }
-    if s.discord_voice {
-        parts.push(
-            "(((udp.DstPort >= 19294 and udp.DstPort <= 19344) or (udp.DstPort >= 50000 and udp.DstPort <= 50100)) \
-             and (udp.PayloadLength == 74 or (udp.PayloadLength >= 20 and udp.Payload32[1] == 0x2112A442)))",
-        );
-    }
-    format!("outbound and !loopback and !impostor and ({})", parts.join(" or "))
-}
-
 fn run(args: &[String]) -> Result<(), String> {
-    let strategy = parse_strategy(args)?;
+    let config = Config {
+        engine_dir: engine_dir(args).map_err(|e| e.to_string())?,
+        data_dir: std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("data"),
+        strategy: parse_strategy(args)?,
+        auto: args.iter().any(|a| a == "--auto"),
+        auto_test: args.iter().any(|a| a == "--auto-test"),
+        doh: option(args, "--doh"),
+    };
     let seconds = seconds(args)?;
-    let dir = engine_dir(args).map_err(|e| e.to_string())?;
-    let filter = run_filter(&strategy);
-    vx_divert::check_filter(&dir, &filter).map_err(|e| e.to_string())?;
-    vx_divert::check_filter(&dir, DNS_FILTER).map_err(|e| e.to_string())?;
-    vx_divert::check_filter(&dir, WATCH_FILTER).map_err(|e| e.to_string())?;
-    let doh = option(args, "--doh").map(|p| Doh::new(&p).map_err(|e| e.to_string())).transpose()?;
     if args.iter().any(|a| a == "--check") {
-        println!("Фильтр и приёмы в порядке: {strategy:?}");
+        Engine::check(&config)?;
+        println!("Фильтр и приёмы в порядке: {:?}", config.strategy);
         return Ok(());
     }
-    let divert = Arc::new(Divert::open(&dir, &filter, 0, 0).map_err(|e| e.to_string())?);
-    let dns = doh.map(|d| start_doh(&dir, d)).transpose()?;
-    println!("Обход запущен, {}.", stop_after(&divert, seconds));
-    println!("Приёмы: {strategy:?}");
-    if let Some((_, stats)) = &dns {
-        println!("DNS: через DoH {}, при сбое — обычный DNS.", stats.server);
-    }
-
-    let auto = if args.iter().any(|a| a == "--auto" || a == "--auto-test") {
-        let auto = Auto::start(&dir, &strategy, args.iter().any(|a| a == "--auto-test"))?;
-        println!("Автоподбор: для каждого сайта свой приём, при сбоях — следующий; выбор хранится в {}.", auto.file.display());
-        Some(auto)
-    } else {
-        None
-    };
 
     let started = Instant::now();
-    let mut seen: HashSet<String> = HashSet::new();
-    let (mut changed, mut passed, mut dropped, mut send_errors) = (0u64, 0u64, 0u64, 0u64);
-    let mut buf = vec![0u8; 0xffff];
-    while let Ok((len, addr)) = divert.recv(&mut buf) {
-        let packet = &buf[..len];
-        let chosen = auto.as_ref().and_then(|a| a.pick(packet));
-        let result = match apply(packet, chosen.map_or(&strategy, |i| &auto.as_ref().expect("есть").strategies[i])) {
-            Action::Pass => {
-                passed += 1;
-                divert.send(packet, &addr)
-            }
-            Action::Drop => {
-                dropped += 1;
-                Ok(())
-            }
-            Action::Send(outs) => {
-                changed += 1;
-                if let Some(label) = describe(packet).filter(|l| seen.insert(l.clone())) {
-                    println!("{:>7.1} с  {label}", started.elapsed().as_secs_f32());
-                }
-                outs.into_iter().try_for_each(|mut out| {
-                    let mut a = addr;
-                    divert.calc_checksums(&mut out.data, &mut a);
-                    if out.badsum {
-                        corrupt_tcp_checksum(&mut out.data);
-                    }
-                    divert.send(&out.data, &a)
-                })
-            }
-        };
-        if let Err(e) = result {
-            send_errors += 1;
-            if send_errors <= 3 {
-                eprintln!("Не отправлен пакет: {e}");
-            }
-        }
-    }
-    println!("Готово: изменено {changed}, пропущено {passed}, отброшено QUIC {dropped}, ошибок отправки {send_errors}.");
-    if let Some(auto) = auto {
-        let _ = auto.inbound.shutdown();
-    }
-    if let Some((dns_divert, stats)) = dns {
-        let _ = dns_divert.shutdown();
-        println!(
-            "DNS: через DoH {}, обычным DNS (DoH не ответил) {}.",
-            stats.via_doh.load(Ordering::Relaxed),
-            stats.fallback.load(Ordering::Relaxed)
-        );
-    }
-    Ok(())
-}
-
-/// Копии HTTPS-пакетов для оценки соединений с приёмом: данные и RST/FIN сервера, данные клиента.
-/// shortcut: копируется весь HTTPS-трафик, хотя нужны лишь первые 32 КБ соединений с приёмом — лишняя нагрузка
-/// на процессор при видео; если станет заметно — отключать наблюдение для решённых соединений иначе (WFP/ETW).
-const WATCH_FILTER: &str = "!loopback and (\
-    (inbound and tcp.SrcPort == 443 and (tcp.PayloadLength > 0 or tcp.Rst or tcp.Fin)) or \
-    (outbound and tcp.DstPort == 443 and tcp.PayloadLength > 0))";
-
-/// Сколько тишины ждать, прежде чем подводить итог по соединению.
-const ANSWER_TIMEOUT_MS: u64 = 5000;
-
-/// Автоподбор: приём для сайта выбирает `Tuner`; ответы серверов (копии входящих пакетов) и тайм-ауты сообщают,
-/// сработал ли он. Выбор сохраняется в data\tuning.txt рядом с vx.exe.
-struct Auto {
-    names: Vec<&'static str>,
-    strategies: Vec<Strategy>,
-    state: Arc<std::sync::Mutex<(Tuner, Tracker)>>,
-    inbound: Arc<Divert>,
-    file: PathBuf,
-    started: Instant,
-}
-
-impl Auto {
-    fn start(dir: &std::path::Path, global: &Strategy, test: bool) -> Result<Self, String> {
-        let mut list = presets();
-        if test {
-            list.insert(0, ("без приёмов", passthrough()));
-        }
-        // QUIC и голос Discord — общие настройки из командной строки, автоподбор меняет только приёмы для TLS.
-        let strategies: Vec<Strategy> = list
-            .iter()
-            .map(|(_, s)| Strategy { quic: global.quic, discord_voice: global.discord_voice, ..s.clone() })
-            .collect();
-        let names: Vec<&'static str> = list.iter().map(|(n, _)| *n).collect();
-        let file = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("data").join("tuning.txt");
-        let mut tuner = Tuner::new(names.len(), 0);
-        if !test && let Ok(text) = std::fs::read_to_string(&file) {
-            tuner.load(&text, &names);
-        }
-        let state = Arc::new(std::sync::Mutex::new((tuner, Tracker::default())));
-        let inbound = Arc::new(Divert::open(dir, WATCH_FILTER, 0, FLAG_SNIFF).map_err(|e| e.to_string())?);
-        let auto = Self { names, strategies, state, inbound, file, started: Instant::now() };
-        auto.watch();
-        Ok(auto)
-    }
-
-    fn now_ms(started: Instant) -> u64 {
-        started.elapsed().as_millis() as u64
-    }
-
-    /// Приём для исходящего ClientHello; соединение запоминается до ответа сервера.
-    fn pick(&self, packet: &[u8]) -> Option<usize> {
-        let pkt = parse(packet)?;
-        let (Transport::Tcp(tcp), Some(Proto::Tls { host, .. })) = (pkt.transport, classify(&pkt)) else { return None };
-        let site = site_key(host);
-        let mut state = self.state.lock().ok()?;
-        let choice = state.0.choice(&site);
-        state.1.sent((pkt.src, tcp.src_port, pkt.dst, tcp.dst_port), site, choice, Self::now_ms(self.started));
-        Some(choice)
-    }
-
-    /// Поток ответов серверов и поток тайм-аутов.
-    fn watch(&self) {
-        let names = self.names.clone();
-        let file = self.file.clone();
-        let report = move |state: &mut (Tuner, Tracker), site: String, strategy: usize, ok: bool| {
-            let Some(event) = state.0.report(&site, strategy, ok) else { return };
-            match event {
-                Event::Works { site, strategy } => println!("  {site}: работает с «{}»", names[strategy]),
-                Event::Switched { site, from, to } => {
-                    println!("  {site}: не открывается с «{}» → пробую «{}»", names[from], names[to])
-                }
-            }
-            // Ошибка записи не мешает обходу: выбор просто не сохранится до следующего запуска.
-            let _ = std::fs::create_dir_all(file.parent().unwrap_or(&file))
-                .and_then(|_| std::fs::write(&file, state.0.save(&names)));
-        };
-        let report = Arc::new(report);
-
-        // Все отметки времени — от одного `started`, что и в `pick`: трекер сравнивает, кто говорил последним.
-        let started = self.started;
-        let (inbound, state, rep) = (Arc::clone(&self.inbound), Arc::clone(&self.state), Arc::clone(&report));
-        std::thread::spawn(move || {
-            let mut buf = vec![0u8; 0xffff];
-            while let Ok((len, addr)) = inbound.recv(&mut buf) {
-                let Some(pkt) = parse(&buf[..len]) else { continue };
-                let Transport::Tcp(tcp) = pkt.transport else { continue };
-                let Ok(mut s) = state.lock() else { break };
-                let now = Self::now_ms(started);
-                if addr.outbound() {
-                    s.1.client_data((pkt.src, tcp.src_port, pkt.dst, tcp.dst_port), now);
-                    continue;
-                }
-                let flow = (pkt.dst, tcp.dst_port, pkt.src, tcp.src_port);
-                let (rst, fin) = (tcp.flags & TCP_RST != 0, tcp.flags & TCP_FIN != 0);
-                if let Some((site, strategy, ok)) = s.1.server_packet(flow, tcp.seq, pkt.payload, rst, fin, now) {
-                    rep(&mut s, site, strategy, ok);
-                }
-            }
-        });
-
-        let (state, rep) = (Arc::clone(&self.state), report);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let Ok(mut s) = state.lock() else { break };
-                for (site, strategy, ok) in s.1.expired(Self::now_ms(started), ANSWER_TIMEOUT_MS) {
-                    rep(&mut s, site, strategy, ok);
-                }
-            }
-        });
-    }
-}
-
-/// Исходящие DNS-запросы (UDP 53). Ответы подставляет `start_doh`.
-const DNS_FILTER: &str = "outbound and !loopback and !impostor and udp.DstPort == 53";
-
-struct DnsStats {
-    server: String,
-    via_doh: AtomicU64,
-    fallback: AtomicU64,
-}
-
-/// Перехват DNS: запрос → DoH → ответ подставляется входящим пакетом. Если DoH не ответил или ответил не тем —
-/// исходный запрос отправляется дальше без изменений, и сайт откроется через обычный DNS, как без программы.
-fn start_doh(dir: &std::path::Path, doh: Doh) -> Result<(Arc<Divert>, Arc<DnsStats>), String> {
-    let divert = Arc::new(Divert::open(dir, DNS_FILTER, 0, 0).map_err(|e| e.to_string())?);
-    let stats = Arc::new(DnsStats { server: doh.host.clone(), via_doh: AtomicU64::new(0), fallback: AtomicU64::new(0) });
-    let doh = Arc::new(doh);
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, vx_divert::Address)>();
-    let rx = Arc::new(std::sync::Mutex::new(rx));
-
-    // Несколько запросов параллельно: один медленный ответ не задерживает остальные.
-    for _ in 0..8 {
-        let (divert, doh, stats, rx) = (Arc::clone(&divert), Arc::clone(&doh), Arc::clone(&stats), Arc::clone(&rx));
-        std::thread::spawn(move || {
-            while let Ok((packet, addr)) = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ())) {
-                match resolve(&doh, &packet) {
-                    Some(reply) => {
-                        let mut reply = reply;
-                        let mut a = addr;
-                        a.set_outbound(false);
-                        divert.calc_checksums(&mut reply, &mut a);
-                        if divert.send(&reply, &a).is_ok() {
-                            stats.via_doh.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        stats.fallback.fetch_add(1, Ordering::Relaxed);
-                        let _ = divert.send(&packet, &addr);
-                    }
-                    None => {
-                        stats.fallback.fetch_add(1, Ordering::Relaxed);
-                        let _ = divert.send(&packet, &addr);
-                    }
-                }
-            }
-        });
-    }
-
-    let reader = Arc::clone(&divert);
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; 0xffff];
-        while let Ok((len, addr)) = reader.recv(&mut buf) {
-            if tx.send((buf[..len].to_vec(), addr)).is_err() {
-                break;
-            }
+    let sink: vx_engine::Sink = Arc::new(move |event| {
+        let t = started.elapsed().as_secs_f32();
+        match event {
+            EngineEvent::Site { kind, host, target } => println!("{t:>7.1} с  {kind:<5} {host:<35} → {target}"),
+            EngineEvent::Works { site, strategy } => println!("  {site}: работает с «{strategy}»"),
+            EngineEvent::Switched { site, from, to } => println!("  {site}: не открывается с «{from}» → пробую «{to}»"),
+            EngineEvent::Warning(text) => eprintln!("{text}"),
         }
     });
-    Ok((divert, stats))
-}
-
-/// Ответный пакет из DoH или `None`, если запрос не наш (сам DoH-сервер), DoH не ответил или ответил не на то.
-fn resolve(doh: &Doh, packet: &[u8]) -> Option<Vec<u8>> {
-    let pkt = parse(packet)?;
-    let (name, _) = dns::question(pkt.payload)?;
-    if name == doh.host {
-        return None;
+    let strategy = config.strategy.clone();
+    let engine = Engine::start(config, sink)?;
+    println!("Обход запущен, {}.", seconds.map_or("остановка — Ctrl+C".into(), |s| format!("{s} с")));
+    println!("Приёмы: {strategy:?}");
+    if let Some(server) = &engine.doh_server {
+        println!("DNS: через DoH {server}, при сбое — обычный DNS.");
     }
-    let answer = doh.query(pkt.payload).ok()?;
-    dns::is_answer_to(pkt.payload, &answer).then(|| dns::reply_packet(&pkt, &answer)).flatten()
+    if let Some(file) = &engine.tuning_file {
+        println!("Автоподбор: для каждого сайта свой приём, при сбоях — следующий; выбор хранится в {}.", file.display());
+    }
+
+    // Без --seconds работает до Ctrl+C: процесс завершается, драйвер сам пускает трафик напрямую.
+    match seconds {
+        Some(s) => std::thread::sleep(Duration::from_secs(s)),
+        None => loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        },
+    }
+    let s = engine.stop();
+    println!("Готово: изменено {}, пропущено {}, отброшено QUIC {}, ошибок отправки {}.", s.changed, s.passed, s.dropped, s.send_errors);
+    if s.doh_ok + s.doh_fallback > 0 {
+        println!("DNS: через DoH {}, обычным DNS (DoH не ответил) {}.", s.doh_ok, s.doh_fallback);
+    }
+    Ok(())
 }
 
 fn doh_test(args: &[String]) -> Result<(), String> {
@@ -478,24 +246,6 @@ fn doh_test(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// «TLS  youtube.com → 142.250.74.46:443» для журнала.
-fn describe(packet: &[u8]) -> Option<String> {
-    let pkt = parse(packet)?;
-    let (kind, host) = match classify(&pkt)? {
-        Proto::Tls { host, .. } => ("TLS ", host),
-        Proto::Http { host, .. } => ("HTTP", host),
-        Proto::Quic => ("QUIC", ""),
-        Proto::DiscordVoice => ("ГОЛОС", "Discord"),
-        Proto::Stun => ("STUN", ""),
-    };
-    let port = match pkt.transport {
-        Transport::Tcp(t) => t.dst_port,
-        Transport::Udp(u) => u.dst_port,
-        Transport::Other(_) => 0,
-    };
-    Some(format!("{kind:<5} {host:<35} → {}:{port}", pkt.dst))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,12 +262,5 @@ mod tests {
         assert_eq!((s.repeats, s.quic, s.disorder, s.fake, s.discord_voice), (3, QuicMode::Drop, false, true, true));
         assert_eq!(parse_strategy(&args("--split none")).unwrap().split, vec![]);
         assert!(parse_strategy(&args("--fooling ttl=x")).is_err());
-    }
-
-    #[test]
-    fn filter_skips_quic_and_voice_when_not_needed() {
-        let base = run_filter(&Strategy { quic: QuicMode::Pass, ..Strategy::default() });
-        assert!(!base.contains("udp"));
-        assert!(run_filter(&Strategy { discord_voice: true, ..Strategy::default() }).contains("50000"));
     }
 }

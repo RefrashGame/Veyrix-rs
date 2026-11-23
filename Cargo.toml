@@ -1,11 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/divert", "crates/doh", "crates/cli"]
+members = ["crates/core", "crates/divert", "crates/doh", "crates/engine", "crates/cli", "app/src-tauri"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+# Ниже не опускать: resolver 3 подбирает зависимости под эту версию (с 1.85 брал старый Tauri, не совпадавший с npm).
+rust-version = "1.100"
 publish = false
 
 [profile.release]

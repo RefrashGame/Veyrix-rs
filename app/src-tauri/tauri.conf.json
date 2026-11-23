@@ -14,9 +14,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "app",
-        "width": 1400,
-        "height": 918,
+        "title": "Veyrix",
+        "width": 960,
+        "height": 680,
+        "minWidth": 760,
+        "minHeight": 520,
         "center": true,
         "visible": false
       }
