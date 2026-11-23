@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use vx_core::desync::corrupt_tcp_checksum;
 use vx_core::{Action, Fooling, Proto, QuicMode, SplitPos, Strategy, Transport, apply, classify, parse};
 use vx_core::dns;
-use vx_core::packet::TCP_RST;
+use vx_core::packet::{TCP_FIN, TCP_RST};
 use vx_core::tuner::{Event, Tracker, Tuner, passthrough, presets, site_key};
 use vx_divert::{Divert, FLAG_SNIFF};
 use vx_doh::Doh;
@@ -204,7 +204,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let filter = run_filter(&strategy);
     vx_divert::check_filter(&dir, &filter).map_err(|e| e.to_string())?;
     vx_divert::check_filter(&dir, DNS_FILTER).map_err(|e| e.to_string())?;
-    vx_divert::check_filter(&dir, INBOUND_FILTER).map_err(|e| e.to_string())?;
+    vx_divert::check_filter(&dir, WATCH_FILTER).map_err(|e| e.to_string())?;
     let doh = option(args, "--doh").map(|p| Doh::new(&p).map_err(|e| e.to_string())).transpose()?;
     if args.iter().any(|a| a == "--check") {
         println!("Фильтр и приёмы в порядке: {strategy:?}");
@@ -279,11 +279,14 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Ответы серверов на соединения с приёмами: ServerHello (успех) или RST (сброс, обычно от DPI). Только копии.
-const INBOUND_FILTER: &str = "inbound and !loopback and tcp.SrcPort == 443 and \
-    ((tcp.PayloadLength > 5 and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x02) or tcp.Rst)";
+/// Копии HTTPS-пакетов для оценки соединений с приёмом: данные и RST/FIN сервера, данные клиента.
+/// shortcut: копируется весь HTTPS-трафик, хотя нужны лишь первые 32 КБ соединений с приёмом — лишняя нагрузка
+/// на процессор при видео; если станет заметно — отключать наблюдение для решённых соединений иначе (WFP/ETW).
+const WATCH_FILTER: &str = "!loopback and (\
+    (inbound and tcp.SrcPort == 443 and (tcp.PayloadLength > 0 or tcp.Rst or tcp.Fin)) or \
+    (outbound and tcp.DstPort == 443 and tcp.PayloadLength > 0))";
 
-/// Сколько ждать ServerHello, прежде чем считать соединение неудачным.
+/// Сколько тишины ждать, прежде чем подводить итог по соединению.
 const ANSWER_TIMEOUT_MS: u64 = 5000;
 
 /// Автоподбор: приём для сайта выбирает `Tuner`; ответы серверов (копии входящих пакетов) и тайм-ауты сообщают,
@@ -315,7 +318,7 @@ impl Auto {
             tuner.load(&text, &names);
         }
         let state = Arc::new(std::sync::Mutex::new((tuner, Tracker::default())));
-        let inbound = Arc::new(Divert::open(dir, INBOUND_FILTER, 0, FLAG_SNIFF).map_err(|e| e.to_string())?);
+        let inbound = Arc::new(Divert::open(dir, WATCH_FILTER, 0, FLAG_SNIFF).map_err(|e| e.to_string())?);
         let auto = Self { names, strategies, state, inbound, file, started: Instant::now() };
         auto.watch();
         Ok(auto)
@@ -354,27 +357,35 @@ impl Auto {
         };
         let report = Arc::new(report);
 
+        // Все отметки времени — от одного `started`, что и в `pick`: трекер сравнивает, кто говорил последним.
+        let started = self.started;
         let (inbound, state, rep) = (Arc::clone(&self.inbound), Arc::clone(&self.state), Arc::clone(&report));
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 0xffff];
-            while let Ok((len, _)) = inbound.recv(&mut buf) {
+            while let Ok((len, addr)) = inbound.recv(&mut buf) {
                 let Some(pkt) = parse(&buf[..len]) else { continue };
                 let Transport::Tcp(tcp) = pkt.transport else { continue };
-                let ok = tcp.flags & TCP_RST == 0;
                 let Ok(mut s) = state.lock() else { break };
-                if let Some((site, strategy, ok)) = s.1.answered((pkt.dst, tcp.dst_port, pkt.src, tcp.src_port), ok) {
+                let now = Self::now_ms(started);
+                if addr.outbound() {
+                    s.1.client_data((pkt.src, tcp.src_port, pkt.dst, tcp.dst_port), now);
+                    continue;
+                }
+                let flow = (pkt.dst, tcp.dst_port, pkt.src, tcp.src_port);
+                let (rst, fin) = (tcp.flags & TCP_RST != 0, tcp.flags & TCP_FIN != 0);
+                if let Some((site, strategy, ok)) = s.1.server_packet(flow, tcp.seq, pkt.payload, rst, fin, now) {
                     rep(&mut s, site, strategy, ok);
                 }
             }
         });
 
-        let (state, rep, started) = (Arc::clone(&self.state), report, self.started);
+        let (state, rep) = (Arc::clone(&self.state), report);
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let Ok(mut s) = state.lock() else { break };
-                for (site, strategy) in s.1.expired(Self::now_ms(started), ANSWER_TIMEOUT_MS) {
-                    rep(&mut s, site, strategy, false);
+                for (site, strategy, ok) in s.1.expired(Self::now_ms(started), ANSWER_TIMEOUT_MS) {
+                    rep(&mut s, site, strategy, ok);
                 }
             }
         });

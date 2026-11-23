@@ -119,38 +119,142 @@ impl Tuner {
 /// Соединение: (адрес и порт клиента, адрес и порт сервера).
 pub type Flow = (IpAddr, u16, IpAddr, u16);
 
+/// Столько данных от сервера — соединение точно не заморожено (ТСПУ замораживает после 16–20 КБ).
+pub const SUCCESS_BYTES: u64 = 32 * 1024;
+
+/// Разбор потока TLS-записей сервера по заголовкам (тип, версия, длина — открыты даже в зашифрованном TLS):
+/// по нему видно, оборвался ли ответ посреди записи.
+#[derive(Default)]
+struct Records {
+    /// Следующий ожидаемый seq; `None` — данных ещё не было.
+    next_seq: Option<u32>,
+    /// Сколько байт текущей записи ещё не пришло.
+    need: usize,
+    /// Начало заголовка записи, разрезанного между пакетами.
+    header: Vec<u8>,
+    /// Пакеты пришли не по порядку — границы записей больше не известны.
+    lost: bool,
+}
+
+impl Records {
+    fn feed(&mut self, seq: u32, mut payload: &[u8]) {
+        if self.lost || payload.is_empty() {
+            return;
+        }
+        let expected = *self.next_seq.get_or_insert(seq);
+        // Разница seq с учётом переполнения: < 0 — повтор уже виденного, > 0 — пропуск (пакет обогнал предыдущий).
+        let diff = seq.wrapping_sub(expected) as i32;
+        if diff > 0 {
+            self.lost = true;
+            return;
+        }
+        let seen = diff.unsigned_abs() as usize;
+        if seen >= payload.len() {
+            return;
+        }
+        payload = &payload[seen..];
+        self.next_seq = Some(expected.wrapping_add(payload.len() as u32));
+        while !payload.is_empty() {
+            if self.need > 0 {
+                let take = self.need.min(payload.len());
+                self.need -= take;
+                payload = &payload[take..];
+            } else {
+                let take = (5 - self.header.len()).min(payload.len());
+                self.header.extend_from_slice(&payload[..take]);
+                payload = &payload[take..];
+                if self.header.len() == 5 {
+                    self.need = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                    self.header.clear();
+                }
+            }
+        }
+    }
+
+    /// Ответ оборвался посреди записи (известно только при пакетах по порядку).
+    fn incomplete(&self) -> bool {
+        !self.lost && (self.need > 0 || !self.header.is_empty())
+    }
+}
+
 struct Pending {
     site: String,
     strategy: usize,
-    sent_ms: u64,
+    client_ms: u64,
+    server_ms: Option<u64>,
+    server_bytes: u64,
+    records: Records,
 }
 
-/// Ожидающие ответа соединения, к которым применён приём.
+impl Pending {
+    /// Клиент ждёт: последним говорил он, а сервер ещё не ответил.
+    fn client_waiting(&self) -> bool {
+        self.server_ms.is_none_or(|s| self.client_ms > s)
+    }
+}
+
+/// Соединения с приёмом, по которым ещё не ясно, открылся ли сайт.
+///
+/// Успех: от сервера ≥ `SUCCESS_BYTES`; закрытие сервером (FIN) на границе записи; тишина при законченном
+/// обмене (все записи целы, клиент не ждёт). Неудача: RST до `SUCCESS_BYTES`; FIN посреди записи; тишина,
+/// когда клиент ждёт ответа или запись оборвалась на середине — «замирание».
 #[derive(Default)]
 pub struct Tracker {
     pending: HashMap<Flow, Pending>,
 }
 
+/// Итог по соединению: сайт, номер приёма, успех.
+pub type Verdict = (String, usize, bool);
+
 impl Tracker {
-    /// Отправлен ClientHello. Повтор (TCP перепослал) не сбрасывает время первого.
+    /// Отправлен ClientHello с приёмом. Повтор (TCP перепослал) ничего не меняет.
     pub fn sent(&mut self, flow: Flow, site: String, strategy: usize, now_ms: u64) {
-        self.pending.entry(flow).or_insert(Pending { site, strategy, sent_ms: now_ms });
+        self.pending.entry(flow).or_insert(Pending {
+            site,
+            strategy,
+            client_ms: now_ms,
+            server_ms: None,
+            server_bytes: 0,
+            records: Records::default(),
+        });
     }
 
-    /// Ответ сервера: `ok` — ServerHello, иначе RST. `flow` — в направлении клиент → сервер.
-    pub fn answered(&mut self, flow: Flow, ok: bool) -> Option<(String, usize, bool)> {
-        self.pending.remove(&flow).map(|p| (p.site, p.strategy, ok))
+    /// Клиент отправил данные по отслеживаемому соединению.
+    pub fn client_data(&mut self, flow: Flow, now_ms: u64) {
+        if let Some(p) = self.pending.get_mut(&flow) {
+            p.client_ms = now_ms;
+        }
     }
 
-    /// Соединения без ответа дольше `timeout_ms` — неудачи.
-    pub fn expired(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<(String, usize)> {
+    /// Пакет сервера (`flow` — в направлении клиент → сервер). Возвращает итог, если он стал ясен.
+    pub fn server_packet(&mut self, flow: Flow, seq: u32, payload: &[u8], rst: bool, fin: bool, now_ms: u64) -> Option<Verdict> {
+        let p = self.pending.get_mut(&flow)?;
+        if !payload.is_empty() {
+            p.server_ms = Some(now_ms);
+            p.server_bytes += payload.len() as u64;
+            p.records.feed(seq, payload);
+        }
+        let ok = match () {
+            _ if p.server_bytes >= SUCCESS_BYTES => true,
+            _ if rst => false,
+            _ if fin => p.server_bytes > 0 && !p.records.incomplete(),
+            _ => return None,
+        };
+        let p = self.pending.remove(&flow)?;
+        Some((p.site, p.strategy, ok))
+    }
+
+    /// Соединения, где `timeout_ms` ничего не происходит: неудача, если ответ ждут или он оборван, иначе успех.
+    pub fn expired(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<Verdict> {
         let mut out = Vec::new();
         self.pending.retain(|_, p| {
-            let alive = now_ms.saturating_sub(p.sent_ms) < timeout_ms;
-            if !alive {
-                out.push((p.site.clone(), p.strategy));
+            let last = p.client_ms.max(p.server_ms.unwrap_or(0));
+            if now_ms.saturating_sub(last) < timeout_ms {
+                return true;
             }
-            alive
+            let stalled = p.client_waiting() || p.records.incomplete();
+            out.push((p.site.clone(), p.strategy, !stalled));
+            false
         });
         out
     }
@@ -211,18 +315,92 @@ mod tests {
         assert_eq!(loaded.choice("x.com"), 0);
     }
 
+    fn flow(port: u16) -> Flow {
+        ("192.168.1.10".parse().unwrap(), port, "1.2.3.4".parse().unwrap(), 443)
+    }
+
+    /// TLS-запись заданной длины тела (заголовок 23 03 03 + длина).
+    fn record(len: usize) -> Vec<u8> {
+        let mut r = vec![0x17, 0x03, 0x03, (len >> 8) as u8, len as u8];
+        r.resize(5 + len, 0xaa);
+        r
+    }
+
     #[test]
-    fn tracker_answers_and_timeouts() {
-        let flow = |port| -> Flow { ("192.168.1.10".parse().unwrap(), port, "1.2.3.4".parse().unwrap(), 443) };
+    fn no_answer_is_a_failure() {
         let mut tr = Tracker::default();
         tr.sent(flow(1), "a.com".into(), 0, 1000);
         tr.sent(flow(1), "a.com".into(), 0, 2500); // повтор ClientHello не продлевает ожидание
-        tr.sent(flow(2), "b.com".into(), 3, 1000);
-        assert_eq!(tr.answered(flow(2), true), Some(("b.com".into(), 3, true)));
-        assert_eq!(tr.answered(flow(2), true), None);
         assert!(tr.expired(5999, 5000).is_empty());
-        assert_eq!(tr.expired(6000, 5000), vec![("a.com".into(), 0)]);
+        assert_eq!(tr.expired(6000, 5000), vec![("a.com".into(), 0, false)]);
         assert!(tr.is_empty());
+    }
+
+    #[test]
+    fn freeze_in_the_middle_of_a_record_is_a_failure() {
+        // Как ТСПУ: сервер начал большую запись (16 КБ), прислал 8 КБ — и тишина. Клиент ничего не ждёт сам.
+        let mut tr = Tracker::default();
+        tr.sent(flow(1), "youtube.com".into(), 0, 0);
+        let rec = record(16_000);
+        assert_eq!(tr.server_packet(flow(1), 100, &rec[..8_000], false, false, 100), None);
+        assert_eq!(tr.expired(5_099, 5_000), vec![]);
+        assert_eq!(tr.expired(5_100, 5_000), vec![("youtube.com".into(), 0, false)]);
+    }
+
+    #[test]
+    fn small_complete_exchange_then_silence_is_a_success() {
+        // Короткий ответ целыми записями, потом соединение просто простаивает (keep-alive).
+        let mut tr = Tracker::default();
+        tr.sent(flow(1), "a.com".into(), 2, 0);
+        let mut data = record(90);
+        data.extend(record(1_200));
+        tr.server_packet(flow(1), 1, &data[..700], false, false, 50);
+        tr.server_packet(flow(1), 701, &data[700..], false, false, 60);
+        assert_eq!(tr.expired(6_000, 5_000), vec![("a.com".into(), 2, true)]);
+    }
+
+    #[test]
+    fn client_waiting_without_answer_is_a_failure() {
+        let mut tr = Tracker::default();
+        tr.sent(flow(1), "a.com".into(), 0, 0);
+        tr.server_packet(flow(1), 1, &record(100), false, false, 10);
+        tr.client_data(flow(1), 20); // запрос после ответа на рукопожатие
+        assert_eq!(tr.expired(5_020, 5_000), vec![("a.com".into(), 0, false)]);
+    }
+
+    #[test]
+    fn rst_bytes_and_fin_decide_immediately() {
+        let mut tr = Tracker::default();
+        tr.sent(flow(1), "rst.com".into(), 0, 0);
+        assert_eq!(tr.server_packet(flow(1), 1, &[], true, false, 5), Some(("rst.com".into(), 0, false)));
+
+        tr.sent(flow(2), "big.com".into(), 1, 0);
+        let big = record(40_000);
+        assert_eq!(tr.server_packet(flow(2), 1, &big[..20_000], false, false, 5), None);
+        assert_eq!(tr.server_packet(flow(2), 20_001, &big[20_000..], false, false, 6), Some(("big.com".into(), 1, true)));
+        assert_eq!(tr.server_packet(flow(2), 1, &[], true, false, 7), None); // RST после решения не считается
+
+        tr.sent(flow(3), "fin.com".into(), 0, 0);
+        assert_eq!(tr.server_packet(flow(3), 1, &record(10), false, true, 5), Some(("fin.com".into(), 0, true)));
+        tr.sent(flow(4), "cut.com".into(), 0, 0);
+        assert_eq!(tr.server_packet(flow(4), 1, &record(1000)[..300], false, true, 5), Some(("cut.com".into(), 0, false)));
+        assert!(tr.is_empty());
+    }
+
+    #[test]
+    fn out_of_order_and_retransmits() {
+        let mut r = Records::default();
+        let rec = record(100);
+        r.feed(1000, &rec[..50]);
+        r.feed(1000, &rec[..50]); // повтор
+        r.feed(1030, &rec[30..80]); // повтор с перекрытием — берётся только новое
+        r.feed(1080, &rec[80..]);
+        assert!(!r.incomplete());
+
+        let mut gap = Records::default();
+        gap.feed(1000, &rec[..10]);
+        gap.feed(1050, &rec[50..]); // пропуск — границы записей потеряны, обрыв больше не утверждаем
+        assert!(!gap.incomplete());
     }
 
     #[test]
