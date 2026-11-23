@@ -11,3 +11,4 @@ vx-core = { path = "../core" }
 vx-divert = { path = "../divert" }
 vx-doh = { path = "../doh" }
 vx-engine = { path = "../engine" }
+vx-sysdns = { path = "../sysdns" }

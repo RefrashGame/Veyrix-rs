@@ -221,11 +221,77 @@ export function App() {
                 title="Обход для голоса Discord"
                 hint="Только если провайдер режет голосовые звонки: у части провайдеров это, наоборот, ломает голос."
               />
+              <SystemDns />
             </>
           )}
         </TabsContent>
       </Tabs>
     </div>
+  )
+}
+
+type SysDns = { adapters: { name: string; dns: string }[]; replaced: boolean; servers: string[] }
+
+/// DNS Windows: меняет системную настройку адаптеров, поэтому — только по кнопке и с подтверждением.
+function SystemDns() {
+  const [state, setState] = useState<SysDns | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+
+  useEffect(() => {
+    invoke<SysDns>("sysdns_status").then(setState, (e) => setMessage(String(e)))
+  }, [])
+
+  async function run(command: "sysdns_apply" | "sysdns_restore", done: string) {
+    setBusy(true)
+    setMessage(null)
+    try {
+      setState(await invoke<SysDns>(command))
+      setMessage(done)
+    } catch (e) {
+      setMessage(String(e))
+      invoke<SysDns>("sysdns_status").then(setState, () => {})
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function apply() {
+    const servers = state?.servers.join(" и ") ?? "Яндекс"
+    const ok = window.confirm(
+      `Заменить DNS Windows на ${servers} (Яндекс) на включённых адаптерах Ethernet и Wi-Fi?\n\n` +
+        "Это системная настройка: она действует и без Veyrix. Исходные настройки сохранятся — " +
+        "кнопка «Вернуть исходный DNS» восстановит их. Кэш DNS будет очищен.",
+    )
+    if (ok) run("sysdns_apply", "DNS заменён, кэш очищен.")
+  }
+
+  return (
+    <section className="flex flex-col gap-2 border-t pt-4">
+      <span className="font-medium">DNS Windows</span>
+      <ul className="text-muted-foreground">
+        {state?.adapters.length === 0 && <li>Нет включённых адаптеров Ethernet или Wi-Fi.</li>}
+        {state?.adapters.map((a) => (
+          <li key={a.name}>
+            {a.name}: {a.dns ? a.dns.replaceAll(",", ", ") : "автоматически (DHCP)"}
+          </li>
+        ))}
+      </ul>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" disabled={busy || !state} onClick={apply}>
+          Заменить на Яндекс ({state?.servers.join(", ") ?? "…"})
+        </Button>
+        <Button
+          variant="outline"
+          disabled={busy || !state?.replaced}
+          onClick={() => run("sysdns_restore", "Исходный DNS возвращён, кэш очищен.")}
+        >
+          Вернуть исходный DNS
+        </Button>
+      </div>
+      {state?.replaced && <p className="text-muted-foreground">DNS заменён программой — исходный можно вернуть.</p>}
+      {message && <p>{message}</p>}
+    </section>
   )
 }
 

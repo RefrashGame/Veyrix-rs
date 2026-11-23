@@ -4240,6 +4240,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-opener",
  "vx-engine",
+ "vx-sysdns",
 ]
 
 [[package]]
@@ -4270,6 +4271,7 @@ dependencies = [
  "vx-divert",
  "vx-doh",
  "vx-engine",
+ "vx-sysdns",
 ]
 
 [[package]]
@@ -4292,6 +4294,10 @@ dependencies = [
  "vx-divert",
  "vx-doh",
 ]
+
+[[package]]
+name = "vx-sysdns"
+version = "0.0.1"
 
 [[package]]
 name = "walkdir"

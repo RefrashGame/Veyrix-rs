@@ -21,6 +21,10 @@
 //!     --doh cloudflare        DNS через DNS-over-HTTPS: cloudflare, google, quad9 или https://…; если DoH не ответил —
 //!                             запрос уходит обычному DNS как раньше
 //!
+//! vx sysdns status | set | restore
+//!     DNS Windows: показать; заменить на Яндекс (77.88.8.8, 77.88.8.1) с резервной копией в data\dns-backup.txt;
+//!     вернуть исходный. Каждый раз очищается кэш DNS. Меняет системную настройку — нужен администратор.
+//!
 //! vx doh ИМЯ [--doh cloudflare]
 //!     Проверка DoH без перехвата: адреса сайта через DNS-over-HTTPS.
 
@@ -49,6 +53,7 @@ fn main() -> ExitCode {
         Some("sniff") => sniff(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("doh") => doh_test(&args[1..]),
+        Some("sysdns") => sysdns(&args[1..]),
         _ => {
             eprintln!("Использование: vx sniff | vx run [приёмы] — подробности в docs/DEVELOPMENT.md");
             return ExitCode::from(2);
@@ -224,6 +229,34 @@ fn run(args: &[String]) -> Result<(), String> {
     println!("Готово: изменено {}, пропущено {}, отброшено QUIC {}, ошибок отправки {}.", s.changed, s.passed, s.dropped, s.send_errors);
     if s.doh_ok + s.doh_fallback > 0 {
         println!("DNS: через DoH {}, обычным DNS (DoH не ответил) {}.", s.doh_ok, s.doh_fallback);
+    }
+    Ok(())
+}
+
+fn sysdns(args: &[String]) -> Result<(), String> {
+    let backup = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("data").join("dns-backup.txt");
+    let show = |list: &[vx_sysdns::Adapter]| {
+        for a in list {
+            let dns = if a.manual_dns.is_empty() { "автоматически (DHCP)" } else { &a.manual_dns };
+            println!("  {:<30} {dns}", a.name);
+        }
+    };
+    match args.first().map(String::as_str) {
+        Some("status") | None => {
+            let s = vx_sysdns::status(&backup).map_err(|e| e.to_string())?;
+            show(&s.adapters);
+            println!("{}", if s.replaced { "DNS заменён программой — вернуть: vx sysdns restore" } else { "DNS программой не менялся." });
+        }
+        Some("set") => {
+            let list = vx_sysdns::apply(&vx_sysdns::YANDEX, &backup).map_err(|e| e.to_string())?;
+            show(&list);
+            println!("DNS заменён на {}, кэш очищен. Исходный сохранён в {}.", vx_sysdns::YANDEX.join(", "), backup.display());
+        }
+        Some("restore") => {
+            let n = vx_sysdns::restore(&backup).map_err(|e| e.to_string())?;
+            println!("Исходный DNS возвращён на адаптерах: {n}, кэш очищен.");
+        }
+        Some(other) => return Err(format!("vx sysdns: status, set или restore, а не «{other}»")),
     }
     Ok(())
 }

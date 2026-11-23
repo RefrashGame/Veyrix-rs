@@ -66,6 +66,16 @@ target\release\vx.exe run --auto-test               # все сайты начи
 В консоли: «сайт: работает с «приём»» и «сайт: не открывается с «A» → пробую «B»». Выбор — `data\tuning.txt`
 рядом с `vx.exe` (`--auto-test` его не читает, но перезаписывает).
 
+## DNS Windows (от администратора)
+
+```powershell
+target\release\vx.exe sysdns status    # адаптеры и их DNS — только чтение
+target\release\vx.exe sysdns set       # Яндекс 77.88.8.8 / 77.88.8.1 + очистка кэша; исходный — в data\dns-backup.txt
+target\release\vx.exe sysdns restore   # вернуть исходный (ручной или DHCP) + очистка кэша
+```
+
+То же — кнопками в окне: «Настройки» → «DNS Windows». Системная настройка действует и без программы.
+
 ## DNS-over-HTTPS
 
 ```powershell

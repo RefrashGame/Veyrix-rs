@@ -17,6 +17,7 @@ tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 vx-engine = { path = "../../crates/engine" }
+vx-sysdns = { path = "../../crates/sysdns" }
 log = "0.4"
 tauri-plugin-log = "2.10"
 tauri = { version = "2.12", features = [] }

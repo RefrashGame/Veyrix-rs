@@ -115,6 +115,10 @@ impl Dirs {
         Self { engine, data: exe_dir.join("data") }
     }
 
+    fn dns_backup(&self) -> PathBuf {
+        self.data.join("dns-backup.txt")
+    }
+
     fn settings_file(&self) -> PathBuf {
         self.data.join("settings.json")
     }
@@ -179,6 +183,49 @@ fn engine_status(state: State<AppState>) -> Status {
     state.status()
 }
 
+/// DNS Windows для окна: адаптеры и заменён ли DNS программой.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SysDns {
+    adapters: Vec<AdapterDns>,
+    replaced: bool,
+    servers: [&'static str; 2],
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdapterDns {
+    name: String,
+    /// Пусто — автоматически (DHCP).
+    dns: String,
+}
+
+fn sysdns_dto(status: vx_sysdns::Status) -> SysDns {
+    SysDns {
+        adapters: status.adapters.into_iter().map(|a| AdapterDns { name: a.name, dns: a.manual_dns }).collect(),
+        replaced: status.replaced,
+        servers: vx_sysdns::YANDEX,
+    }
+}
+
+#[tauri::command]
+fn sysdns_status(state: State<AppState>) -> Result<SysDns, String> {
+    vx_sysdns::status(&state.dirs.dns_backup()).map(sysdns_dto).map_err(|e| e.to_string())
+}
+
+/// Меняет системную настройку: окно спрашивает подтверждение до вызова.
+#[tauri::command]
+fn sysdns_apply(state: State<AppState>) -> Result<SysDns, String> {
+    let backup = state.dirs.dns_backup();
+    vx_sysdns::apply(&vx_sysdns::YANDEX, &backup).map_err(|e| e.to_string())?;
+    sysdns_status(state)
+}
+
+#[tauri::command]
+fn sysdns_restore(state: State<AppState>) -> Result<SysDns, String> {
+    vx_sysdns::restore(&state.dirs.dns_backup()).map_err(|e| e.to_string())?;
+    sysdns_status(state)
+}
+
 fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::<R>::new("external-navigation")
         .on_navigation(|webview, url| {
@@ -208,7 +255,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(external_navigation_plugin())
         .manage(AppState { dirs: Dirs::near_exe(), engine: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![load_settings, save_settings, engine_start, engine_stop, engine_status])
+        .invoke_handler(tauri::generate_handler![
+            load_settings,
+            save_settings,
+            engine_start,
+            engine_stop,
+            engine_status,
+            sysdns_status,
+            sysdns_apply,
+            sysdns_restore
+        ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {
                 let _ = webview.window().show();
