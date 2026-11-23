@@ -51,7 +51,7 @@ pub struct Strategy {
     /// Сколько раз отправить каждый фейк.
     pub repeats: u8,
     pub quic: QuicMode,
-    /// Фейки перед голосом Discord (IP discovery, STUN). По умолчанию выключено: у владельца это ломало звонки.
+    /// Фейки перед голосом Discord (IP discovery, STUN). По умолчанию выключено: у части провайдеров это ломает звонки.
     pub discord_voice: bool,
 }
 

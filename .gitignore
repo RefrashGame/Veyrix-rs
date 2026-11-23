@@ -3,3 +3,5 @@
 /engine/
 *.sys
 *.dll
+# Личные инструкции для Claude Code — только локально
+CLAUDE.md

@@ -15,7 +15,8 @@ cargo build --release -p vx
 
 ```powershell
 $e = "target\debug\engine"; New-Item -ItemType Directory -Force $e
-Copy-Item D:\Project\NetPulse\engines\zapret\bin\WinDivert.dll, D:\Project\NetPulse\engines\zapret\bin\WinDivert64.sys $e
+# WinDivert 2.2 (x64) — https://github.com/basil00/WinDivert/releases: из архива взять x64\WinDivert.dll и x64\WinDivert64.sys
+Copy-Item путь\к\WinDivert-2.2.x-A\x64\WinDivert.dll, путь\к\WinDivert-2.2.x-A\x64\WinDivert64.sys $e
 ```
 
 ## Проверка перехвата (от администратора)
@@ -75,7 +76,7 @@ target\release\vx.exe diag     # права, WinDivert, служба BFE, дру
 В окне: вкладка «Диагностика». Крестик прячет окно в трей (обход работает), выход — из меню значка.
 «Запускать вместе с Windows» создаёт задачу Планировщика `Veyrix-rs` (наивысшие права, при входе, задержка 10 с,
 аргумент `--autostart`: окно скрыто, обход стартует с `data\settings.json`); выключение удаляет задачу.
-Значки — `bunx tauri icon D:\Project\NetPulse\assets\logo\veyrix-4096.png` в `app/`.
+Значки — `bunx tauri icon путь\к\логотипу-1024px-или-больше.png` в `app/` (мобильные папки `icons/android` и `icons/ios` не нужны).
 
 ## DNS Windows (от администратора)
 
