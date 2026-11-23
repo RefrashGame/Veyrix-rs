@@ -68,8 +68,11 @@ export function App() {
     invoke<Settings>("load_settings").then(setSettings, (e) => setError(String(e)))
     invoke<Status>("engine_status").then(setStatus, () => {})
     const unlisten = listen<{ kind: LogKind; text: string }>("vx-event", (e) => addLog(e.payload.kind, e.payload.text))
+    // Старт/стоп из трея или автозапуска — окно узнаёт новое состояние.
+    const unlistenStatus = listen<Status>("vx-status", (e) => setStatus(e.payload))
     return () => {
       unlisten.then((stop) => stop())
+      unlistenStatus.then((stop) => stop())
     }
   }, [addLog])
 
@@ -133,8 +136,13 @@ export function App() {
         <TabsList>
           <TabsTrigger value="overview">Обзор</TabsTrigger>
           <TabsTrigger value="log">Журнал</TabsTrigger>
+          <TabsTrigger value="diag">Диагностика</TabsTrigger>
           <TabsTrigger value="settings">Настройки</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="diag" className="pt-4">
+          <Diagnostics />
+        </TabsContent>
 
         <TabsContent value="overview" className="flex flex-col gap-4 pt-4">
           <div className="flex items-center gap-4">
@@ -159,6 +167,9 @@ export function App() {
             <Stat label="DNS обычным путём" value={stats?.dohFallback} />
             <Stat label="Ошибок отправки" value={stats?.sendErrors} />
           </div>
+          <p className="text-xs text-muted-foreground">
+            Крестик сворачивает окно в значок у часов — обход продолжает работать. Выйти — через меню значка.
+          </p>
         </TabsContent>
 
         <TabsContent value="log" className="flex flex-col gap-3 pt-4">
@@ -188,6 +199,7 @@ export function App() {
           ) : (
             <>
               {running && <p className="text-muted-foreground">Изменения применятся после перезапуска обхода.</p>}
+              <Autostart />
               <Check
                 checked={settings.auto}
                 onChange={(auto) => update({ auto })}
@@ -226,6 +238,83 @@ export function App() {
           )}
         </TabsContent>
       </Tabs>
+    </div>
+  )
+}
+
+type DiagCheck = { name: string; level: "ok" | "warning" | "failed"; detail: string; hint: string | null }
+
+const LEVEL: Record<DiagCheck["level"], { label: string; variant: "default" | "secondary" | "destructive" }> = {
+  ok: { label: "в порядке", variant: "default" },
+  warning: { label: "внимание", variant: "secondary" },
+  failed: { label: "ошибка", variant: "destructive" },
+}
+
+/// Диагностика: только чтение системы и один DoH-запрос.
+function Diagnostics() {
+  const [checks, setChecks] = useState<DiagCheck[] | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function run() {
+    setBusy(true)
+    try {
+      setChecks(await invoke<DiagCheck[]>("diagnostics"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="flex max-w-2xl flex-col gap-3 text-sm">
+      <div className="flex items-center gap-3">
+        <Button onClick={run} disabled={busy}>
+          {busy ? "Проверяю…" : "Проверить"}
+        </Button>
+        <span className="text-muted-foreground">Права, WinDivert, служба BFE, другие перехватчики, VPN, прокси, DoH.</span>
+      </div>
+      <ul className="flex flex-col gap-2">
+        {checks?.map((c) => (
+          <li key={c.name} className="rounded-md border p-3">
+            <div className="flex items-center gap-2">
+              <Badge variant={LEVEL[c.level].variant}>{LEVEL[c.level].label}</Badge>
+              <span className="font-medium">{c.name}</span>
+              <span className="text-muted-foreground">{c.detail}</span>
+            </div>
+            {c.level !== "ok" && c.hint && <p className="mt-1 text-muted-foreground">{c.hint}</p>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+/// Автозапуск — задача Планировщика Windows (создаётся только этим переключателем).
+function Autostart() {
+  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    invoke<boolean>("autostart_status").then(setEnabled, () => setEnabled(false))
+  }, [])
+
+  async function set(value: boolean) {
+    setError(null)
+    try {
+      setEnabled(await invoke<boolean>("autostart_set", { enabled: value }))
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <Check
+        checked={enabled ?? false}
+        onChange={set}
+        title="Запускать вместе с Windows"
+        hint="При входе в Windows Veyrix запустится в трее и сразу включит обход с этими настройками (задача «Veyrix-rs» в Планировщике)."
+      />
+      {error && <p className="text-destructive">{error}</p>}
     </div>
   )
 }

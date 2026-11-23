@@ -1,0 +1,12 @@
+[package]
+name = "vx-diag"
+description = "Диагностика: что мешает обходу (права, WinDivert, BFE, другие перехватчики, VPN, прокси, DoH)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+vx-core = { path = "../core" }
+vx-doh = { path = "../doh" }
+vx-sysdns = { path = "../sysdns" }

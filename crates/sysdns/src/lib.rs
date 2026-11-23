@@ -134,8 +134,21 @@ unsafe fn wide_to_string(p: *const u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
-/// Включённые адаптеры Ethernet и Wi-Fi с IPv4 и их DNS, заданный вручную.
-pub fn adapters() -> io::Result<Vec<Adapter>> {
+/// Сетевой интерфейс с IPv4 — для диагностики (поиск VPN и туннелей).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interface {
+    pub guid: String,
+    pub name: String,
+    pub description: String,
+    /// IANA ifType: 6 — Ethernet, 71 — Wi-Fi, 23 — PPP, 53 — виртуальный, 131 — туннель.
+    pub if_type: u32,
+    pub up: bool,
+}
+
+pub const IF_TYPE_PPP: u32 = 23;
+
+/// Все интерфейсы с IPv4.
+pub fn interfaces() -> io::Result<Vec<Interface>> {
     let mut size = 16 * 1024u32;
     // Vec<u64> — выравнивание 8, как требуют структуры внутри буфера.
     let mut buf: Vec<u64> = Vec::new();
@@ -157,15 +170,26 @@ pub fn adapters() -> io::Result<Vec<Adapter>> {
     while !p.is_null() {
         // SAFETY: список заполнен GetAdaptersAddresses и живёт, пока жив buf.
         let a = unsafe { &*p };
-        if a.oper_status == OPER_STATUS_UP && matches!(a.if_type, IF_TYPE_ETHERNET | IF_TYPE_WIFI) {
-            // SAFETY: имя адаптера — ANSI-строка с нулём, дружественное имя — UTF-16 с нулём.
-            let guid = unsafe { std::ffi::CStr::from_ptr(a.adapter_name.cast()) }.to_string_lossy().into_owned();
-            let name = unsafe { wide_to_string(a.friendly_name) };
-            out.push(Adapter { manual_dns: manual_dns(&guid)?, guid, name });
-        }
+        // SAFETY: имя адаптера — ANSI-строка с нулём, имя и описание — UTF-16 с нулём.
+        out.push(Interface {
+            guid: unsafe { std::ffi::CStr::from_ptr(a.adapter_name.cast()) }.to_string_lossy().into_owned(),
+            name: unsafe { wide_to_string(a.friendly_name) },
+            description: unsafe { wide_to_string(a.description) },
+            if_type: a.if_type,
+            up: a.oper_status == OPER_STATUS_UP,
+        });
         p = a.next;
     }
     Ok(out)
+}
+
+/// Включённые адаптеры Ethernet и Wi-Fi с IPv4 и их DNS, заданный вручную.
+pub fn adapters() -> io::Result<Vec<Adapter>> {
+    interfaces()?
+        .into_iter()
+        .filter(|i| i.up && matches!(i.if_type, IF_TYPE_ETHERNET | IF_TYPE_WIFI))
+        .map(|i| Ok(Adapter { manual_dns: manual_dns(&i.guid)?, guid: i.guid, name: i.name }))
+        .collect()
 }
 
 /// DNS адаптера, заданный вручную; `""` — автоматически (DHCP).

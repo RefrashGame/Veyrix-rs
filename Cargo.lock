@@ -4239,6 +4239,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "tauri-plugin-opener",
+ "vx-diag",
  "vx-engine",
  "vx-sysdns",
 ]
@@ -4268,6 +4269,7 @@ name = "vx"
 version = "0.0.1"
 dependencies = [
  "vx-core",
+ "vx-diag",
  "vx-divert",
  "vx-doh",
  "vx-engine",
@@ -4277,6 +4279,15 @@ dependencies = [
 [[package]]
 name = "vx-core"
 version = "0.0.1"
+
+[[package]]
+name = "vx-diag"
+version = "0.0.1"
+dependencies = [
+ "vx-core",
+ "vx-doh",
+ "vx-sysdns",
+]
 
 [[package]]
 name = "vx-divert"

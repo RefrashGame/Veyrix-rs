@@ -21,6 +21,9 @@
 //!     --doh cloudflare        DNS через DNS-over-HTTPS: cloudflare, google, quad9 или https://…; если DoH не ответил —
 //!                             запрос уходит обычному DNS как раньше
 //!
+//! vx diag [--engine ПАПКА]
+//!     Диагностика: права, WinDivert, служба BFE, другие перехватчики, VPN, прокси, DoH. Только чтение.
+//!
 //! vx sysdns status | set | restore
 //!     DNS Windows: показать; заменить на Яндекс (77.88.8.8, 77.88.8.1) с резервной копией в data\dns-backup.txt;
 //!     вернуть исходный. Каждый раз очищается кэш DNS. Меняет системную настройку — нужен администратор.
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
         Some("run") => run(&args[1..]),
         Some("doh") => doh_test(&args[1..]),
         Some("sysdns") => sysdns(&args[1..]),
+        Some("diag") => diag(&args[1..]),
         _ => {
             eprintln!("Использование: vx sniff | vx run [приёмы] — подробности в docs/DEVELOPMENT.md");
             return ExitCode::from(2);
@@ -229,6 +233,24 @@ fn run(args: &[String]) -> Result<(), String> {
     println!("Готово: изменено {}, пропущено {}, отброшено QUIC {}, ошибок отправки {}.", s.changed, s.passed, s.dropped, s.send_errors);
     if s.doh_ok + s.doh_fallback > 0 {
         println!("DNS: через DoH {}, обычным DNS (DoH не ответил) {}.", s.doh_ok, s.doh_fallback);
+    }
+    Ok(())
+}
+
+fn diag(args: &[String]) -> Result<(), String> {
+    let dir = engine_dir(args).map_err(|e| e.to_string())?;
+    for c in vx_diag::evaluate(&vx_diag::snapshot(&dir)) {
+        let mark = match c.level {
+            vx_diag::Level::Ok => "ок  ",
+            vx_diag::Level::Warning => "!   ",
+            vx_diag::Level::Failed => "ОШИБ",
+        };
+        println!("{mark} {:<30} {}", c.name, c.detail);
+        if c.level != vx_diag::Level::Ok
+            && let Some(hint) = c.hint
+        {
+            println!("     → {hint}");
+        }
     }
     Ok(())
 }
