@@ -25,6 +25,7 @@
     --color-input: var(--input);
     --color-border: var(--border);
     --color-destructive: var(--destructive);
+    --color-warning: var(--warning);
     --color-accent-foreground: var(--accent-foreground);
     --color-accent: var(--accent);
     --color-muted-foreground: var(--muted-foreground);
@@ -84,37 +85,40 @@
 }
 
 .dark {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.922 0 0);
-    --primary-foreground: oklch(0.205 0 0);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
+    /* Палитра Veyrix: почти чёрный фон, тёмно-серые карточки, зелёный акцент. */
+    --background: #070807;
+    --foreground: #f2f3f2;
+    --card: #2a2b2d;
+    --card-foreground: #f2f3f2;
+    --popover: #1c1d1e;
+    --popover-foreground: #f2f3f2;
+    --primary: #39f07a;
+    --primary-foreground: #04220e;
+    --secondary: #232425;
+    --secondary-foreground: #f2f3f2;
+    --muted: #1c1d1e;
+    --muted-foreground: #8b8f8c;
+    --accent: #1c1e1d;
+    --accent-foreground: #f2f3f2;
+    --destructive: #ff5c6c;
+    --border: #222423;
+    --input: #2c2e2d;
+    --ring: #39f07a;
     --chart-1: oklch(0.87 0 0);
     --chart-2: oklch(0.556 0 0);
     --chart-3: oklch(0.439 0 0);
     --chart-4: oklch(0.371 0 0);
     --chart-5: oklch(0.269 0 0);
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.488 0.243 264.376);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+    --sidebar: #0e0f0f;
+    --sidebar-foreground: #d9dbd9;
+    --sidebar-primary: #39f07a;
+    --sidebar-primary-foreground: #04220e;
+    --sidebar-accent: #1c1e1d;
+    --sidebar-accent-foreground: #ffffff;
+    --sidebar-border: #1d1f1e;
+    --sidebar-ring: #39f07a;
+    --warning: #f5b13d;
+    --radius: 0.9rem;
 }
 
 @layer base {
@@ -148,13 +152,25 @@ body {
   overflow: hidden;
 }
 
-/* Scope the desktop scroll shell to the generated root container only. */
+/* Прокручивается только область страницы справа от меню. */
 [data-ui-scroll-container] {
-  height: 100vh;
-  height: 100dvh;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior-y: none;
+}
+
+/* Фон окна: зелёное свечение в правом нижнем углу. */
+.dark body {
+  background:
+    radial-gradient(900px 520px at 100% 100%, rgb(20 170 70 / 0.45), transparent 70%),
+    var(--background);
+}
+
+/* Поле карты: точки сеткой. */
+.map-field {
+  background:
+    radial-gradient(circle, rgb(255 255 255 / 0.06) 1px, transparent 1.3px) 0 0 / 22px 22px,
+    linear-gradient(180deg, #161717 0%, #0b0c0c 100%);
 }
 
 /* Vite mounts into #root, so it needs to inherit the full-height desktop shell. */

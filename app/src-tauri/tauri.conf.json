@@ -15,12 +15,14 @@
     "windows": [
       {
         "title": "Veyrix",
-        "width": 960,
-        "height": 680,
-        "minWidth": 760,
-        "minHeight": 520,
+        "width": 1200,
+        "height": 760,
         "center": true,
-        "visible": false
+        "visible": false,
+        "resizable": false,
+        "maximizable": false,
+        "decorations": false,
+        "shadow": true
       }
     ],
     "security": {

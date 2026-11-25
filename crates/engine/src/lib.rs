@@ -1,7 +1,7 @@
 //! Движок Veyrix-rs: перехват первых пакетов и приёмы обхода, DNS через DoH, автоподбор приёмов по сайтам.
 //! Общий для консоли (`vx run`) и окна (Tauri): события уходят в обработчик, счётчики — через `stats()`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,6 +67,79 @@ struct Counters {
 
 pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// Активность сайта (ключ — домен 2-го уровня) для карты в окне.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteStat {
+    pub site: String,
+    /// Соединений, первый пакет которых прошёл через обход (TLS/HTTP с именем сайта).
+    pub connections: u64,
+    /// DNS-запросов, на которые ответил DoH.
+    pub dns: u64,
+    /// Сколько мс назад было последнее соединение или DNS-запрос.
+    pub idle_ms: u64,
+    /// Приём последнего соединения из автоподбора; `None` — приём из настроек.
+    pub strategy: Option<&'static str>,
+}
+
+/// Сколько сайтов помнить: при переполнении забывается самый давний.
+const SITES_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct SiteEntry {
+    connections: u64,
+    dns: u64,
+    last_ms: u64,
+    strategy: Option<&'static str>,
+}
+
+struct Sites {
+    started: Instant,
+    map: Mutex<HashMap<String, SiteEntry>>,
+}
+
+impl Sites {
+    fn new() -> Self {
+        Self { started: Instant::now(), map: Mutex::new(HashMap::new()) }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn note(&self, host: &str, update: impl FnOnce(&mut SiteEntry)) {
+        // Служебные имена (обратные запросы, имена без точки) — не сайты.
+        if !host.contains('.') || host.ends_with(".arpa") || host.ends_with(".local") {
+            return;
+        }
+        let site = site_key(host);
+        let now = self.now_ms();
+        let Ok(mut map) = self.map.lock() else { return };
+        if !map.contains_key(&site)
+            && map.len() >= SITES_LIMIT
+            && let Some(oldest) = map.iter().min_by_key(|(_, e)| e.last_ms).map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+        let entry = map.entry(site).or_default();
+        entry.last_ms = now;
+        update(entry);
+    }
+
+    fn list(&self) -> Vec<SiteStat> {
+        let now = self.now_ms();
+        let Ok(map) = self.map.lock() else { return Vec::new() };
+        map.iter()
+            .map(|(site, e)| SiteStat {
+                site: site.clone(),
+                connections: e.connections,
+                dns: e.dns,
+                idle_ms: now.saturating_sub(e.last_ms),
+                strategy: e.strategy,
+            })
+            .collect()
+    }
+}
+
 /// Фильтр в ядре: только первые пакеты, которые приёмы меняют. Весь остальной трафик в программу не попадает.
 pub fn run_filter(s: &Strategy) -> String {
     let mut parts = vec![
@@ -103,6 +176,7 @@ pub struct Engine {
     handles: Vec<Arc<Divert>>,
     main: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
+    sites: Arc<Sites>,
     /// Адрес DoH-сервера, если DoH включён.
     pub doh_server: Option<String>,
     /// Файл выбора автоподбора, если автоподбор включён.
@@ -122,6 +196,7 @@ impl Engine {
     pub fn start(config: Config, sink: Sink) -> Result<Self, String> {
         Self::check(&config)?;
         let counters = Arc::new(Counters::default());
+        let sites = Arc::new(Sites::new());
         let main = Arc::new(Divert::open(&config.engine_dir, &run_filter(&config.strategy), 0, 0).map_err(|e| e.to_string())?);
         let mut handles = vec![Arc::clone(&main)];
 
@@ -129,7 +204,7 @@ impl Engine {
         if let Some(provider) = &config.doh {
             let doh = Doh::new(provider).map_err(|e| e.to_string())?;
             doh_server = Some(doh.host.clone());
-            handles.push(start_doh(&config.engine_dir, doh, Arc::clone(&counters))?);
+            handles.push(start_doh(&config.engine_dir, doh, Arc::clone(&counters), Arc::clone(&sites))?);
         }
 
         let auto = if config.auto || config.auto_test {
@@ -141,9 +216,9 @@ impl Engine {
         };
         let tuning_file = auto.as_ref().map(|a| a.file.clone());
 
-        let (strategy, c) = (config.strategy.clone(), Arc::clone(&counters));
-        let main_thread = std::thread::spawn(move || packet_loop(&main, &strategy, auto.as_ref(), &c, &sink));
-        Ok(Self { handles, main: Some(main_thread), counters, doh_server, tuning_file })
+        let (strategy, c, s) = (config.strategy.clone(), Arc::clone(&counters), Arc::clone(&sites));
+        let main_thread = std::thread::spawn(move || packet_loop(&main, &strategy, auto.as_ref(), &c, &s, &sink));
+        Ok(Self { handles, main: Some(main_thread), counters, sites, doh_server, tuning_file })
     }
 
     pub fn stats(&self) -> Stats {
@@ -157,6 +232,16 @@ impl Engine {
             doh_ok: get(&c.doh_ok),
             doh_fallback: get(&c.doh_fallback),
         }
+    }
+
+    /// Сайты, которые обход видел с запуска.
+    pub fn sites(&self) -> Vec<SiteStat> {
+        self.sites.list()
+    }
+
+    /// Сколько времени работает обход.
+    pub fn uptime(&self) -> Duration {
+        self.sites.started.elapsed()
     }
 
     pub fn stop(mut self) -> Stats {
@@ -180,13 +265,19 @@ impl Drop for Engine {
     }
 }
 
-fn packet_loop(divert: &Divert, strategy: &Strategy, auto: Option<&Auto>, c: &Counters, sink: &Sink) {
+fn packet_loop(divert: &Divert, strategy: &Strategy, auto: Option<&Auto>, c: &Counters, sites: &Sites, sink: &Sink) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut buf = vec![0u8; 0xffff];
     while let Ok((len, addr)) = divert.recv(&mut buf) {
         let packet = &buf[..len];
-        let chosen = auto.and_then(|a| a.pick(packet).map(|i| &a.strategies[i]));
-        let result = match apply(packet, chosen.unwrap_or(strategy)) {
+        let chosen = auto.and_then(|a| a.pick(packet).map(|i| (&a.strategies[i], a.names[i])));
+        if let Some(host) = host_of(packet) {
+            sites.note(&host, |e| {
+                e.connections += 1;
+                e.strategy = chosen.map(|(_, name)| name);
+            });
+        }
+        let result = match apply(packet, chosen.map_or(strategy, |(s, _)| s)) {
             Action::Pass => {
                 c.passed.fetch_add(1, Ordering::Relaxed);
                 divert.send(packet, &addr)
@@ -221,6 +312,14 @@ fn packet_loop(divert: &Divert, strategy: &Strategy, auto: Option<&Auto>, c: &Co
     }
 }
 
+/// Имя сайта из первого пакета TLS или HTTP.
+fn host_of(packet: &[u8]) -> Option<String> {
+    match classify(&parse(packet)?)? {
+        Proto::Tls { host, .. } | Proto::Http { host, .. } if !host.is_empty() => Some(host.to_string()),
+        _ => None,
+    }
+}
+
 /// Событие «сайт» для журнала.
 fn describe(packet: &[u8]) -> Option<Event> {
     let pkt = parse(packet)?;
@@ -242,6 +341,7 @@ fn describe(packet: &[u8]) -> Option<Event> {
 /// Автоподбор: приём для сайта выбирает `Tuner`; копии HTTPS-пакетов и тайм-ауты сообщают, сработал ли он.
 struct Auto {
     strategies: Vec<Strategy>,
+    names: Vec<&'static str>,
     state: Arc<Mutex<(Tuner, Tracker)>>,
     watch: Arc<Divert>,
     file: PathBuf,
@@ -270,7 +370,7 @@ impl Auto {
         }
         let state = Arc::new(Mutex::new((tuner, Tracker::default())));
         let watch = Arc::new(Divert::open(&config.engine_dir, WATCH_FILTER, 0, FLAG_SNIFF).map_err(|e| e.to_string())?);
-        let auto = Self { strategies, state, watch, file, started: Instant::now() };
+        let auto = Self { strategies, names: names.clone(), state, watch, file, started: Instant::now() };
         auto.spawn_watchers(names, sink);
         Ok(auto)
     }
@@ -344,7 +444,7 @@ impl Auto {
 
 /// Перехват DNS: запрос → DoH → ответ подставляется входящим пакетом. Если DoH не ответил или ответил не тем —
 /// исходный запрос отправляется дальше без изменений, и сайт откроется через обычный DNS, как без программы.
-fn start_doh(dir: &Path, doh: Doh, c: Arc<Counters>) -> Result<Arc<Divert>, String> {
+fn start_doh(dir: &Path, doh: Doh, c: Arc<Counters>, sites: Arc<Sites>) -> Result<Arc<Divert>, String> {
     let divert = Arc::new(Divert::open(dir, DNS_FILTER, 0, 0).map_err(|e| e.to_string())?);
     let doh = Arc::new(doh);
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, vx_divert::Address)>();
@@ -352,10 +452,12 @@ fn start_doh(dir: &Path, doh: Doh, c: Arc<Counters>) -> Result<Arc<Divert>, Stri
 
     // Несколько запросов параллельно: один медленный ответ не задерживает остальные.
     for _ in 0..8 {
-        let (divert, doh, c, rx) = (Arc::clone(&divert), Arc::clone(&doh), Arc::clone(&c), Arc::clone(&rx));
+        let (divert, doh, c, rx, sites) =
+            (Arc::clone(&divert), Arc::clone(&doh), Arc::clone(&c), Arc::clone(&rx), Arc::clone(&sites));
         std::thread::spawn(move || {
             while let Ok((packet, addr)) = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ())) {
-                if let Some(mut reply) = resolve(&doh, &packet) {
+                if let Some((name, mut reply)) = resolve(&doh, &packet) {
+                    sites.note(&name, |e| e.dns += 1);
                     let mut a = addr;
                     a.set_outbound(false);
                     divert.calc_checksums(&mut reply, &mut a);
@@ -382,15 +484,17 @@ fn start_doh(dir: &Path, doh: Doh, c: Arc<Counters>) -> Result<Arc<Divert>, Stri
     Ok(divert)
 }
 
-/// Ответный пакет из DoH или `None`, если запрос к самому DoH-серверу, DoH не ответил или ответил не на то.
-fn resolve(doh: &Doh, packet: &[u8]) -> Option<Vec<u8>> {
+/// Имя из запроса и ответный пакет из DoH или `None`, если запрос к самому DoH-серверу, DoH не ответил
+/// или ответил не на то.
+fn resolve(doh: &Doh, packet: &[u8]) -> Option<(String, Vec<u8>)> {
     let pkt = parse(packet)?;
     let (name, _) = dns::question(pkt.payload)?;
     if name == doh.host {
         return None;
     }
     let answer = doh.query(pkt.payload).ok()?;
-    dns::is_answer_to(pkt.payload, &answer).then(|| dns::reply_packet(&pkt, &answer)).flatten()
+    let reply = dns::is_answer_to(pkt.payload, &answer).then(|| dns::reply_packet(&pkt, &answer)).flatten()?;
+    Some((name, reply))
 }
 
 #[cfg(test)]
@@ -402,6 +506,27 @@ mod tests {
         let base = run_filter(&Strategy { quic: QuicMode::Pass, ..Strategy::default() });
         assert!(!base.contains("udp"));
         assert!(run_filter(&Strategy { discord_voice: true, ..Strategy::default() }).contains("50000"));
+    }
+
+    #[test]
+    fn sites_group_by_domain_and_skip_service_names() {
+        let sites = Sites::new();
+        sites.note("rr1---sn-x.googlevideo.com", |e| e.connections += 1);
+        sites.note("www.googlevideo.com", |e| e.dns += 1);
+        sites.note("1.0.0.127.in-addr.arpa", |e| e.dns += 1);
+        sites.note("wpad", |e| e.dns += 1);
+        let list = sites.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].site.as_str(), list[0].connections, list[0].dns), ("googlevideo.com", 1, 1));
+    }
+
+    #[test]
+    fn sites_forget_the_oldest_when_full() {
+        let sites = Sites::new();
+        for i in 0..=SITES_LIMIT {
+            sites.note(&format!("site{i}.com"), |e| e.connections += 1);
+        }
+        assert_eq!(sites.list().len(), SITES_LIMIT);
     }
 
     #[test]

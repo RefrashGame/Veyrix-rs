@@ -8,7 +8,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use vx_engine::vx_core::{QuicMode, Strategy};
-use vx_engine::{Config, Engine, Event, Stats};
+use vx_engine::{Config, Engine, Event, SiteStat, Stats};
 
 /// Настройки из окна; хранятся в data\settings.json рядом с exe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +29,8 @@ struct Settings {
     tg_secret: String,
     /// Резерв через Cloudflare-домены Flowseal.
     tg_cloudflare: bool,
+    /// Окно в мини-режиме.
+    mini: bool,
 }
 
 impl Default for Settings {
@@ -42,6 +44,7 @@ impl Default for Settings {
             tg_port: 1443,
             tg_secret: String::new(),
             tg_cloudflare: true,
+            mini: false,
         }
     }
 }
@@ -71,6 +74,26 @@ struct Status {
     running: bool,
     stats: StatsDto,
     doh_server: Option<String>,
+    /// Сколько секунд работает обход.
+    uptime_secs: u64,
+    /// Сайты для карты на «Обзоре».
+    sites: Vec<SiteDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SiteDto {
+    site: String,
+    connections: u64,
+    dns: u64,
+    idle_ms: u64,
+    strategy: Option<&'static str>,
+}
+
+impl From<SiteStat> for SiteDto {
+    fn from(s: SiteStat) -> Self {
+        Self { site: s.site, connections: s.connections, dns: s.dns, idle_ms: s.idle_ms, strategy: s.strategy }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -98,22 +121,35 @@ impl From<Stats> for StatsDto {
 }
 
 /// Запись журнала для окна: вид и текст (время ставит окно при получении).
+/// `site` — ключ сайта для итогов автоподбора: карта на «Обзоре» отмечает сменённый приём.
 #[derive(Debug, Clone, Serialize)]
 struct LogEntry {
     kind: &'static str,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
+}
+
+impl LogEntry {
+    fn new(kind: &'static str, text: String) -> Self {
+        Self { kind, text, site: None }
+    }
 }
 
 fn log_entry(event: Event) -> LogEntry {
     match event {
         Event::Site { kind, host, target } => {
-            LogEntry { kind: "site", text: format!("{kind} {} → {target}", if host.is_empty() { "—" } else { &host }) }
+            LogEntry::new("site", format!("{kind} {} → {target}", if host.is_empty() { "—" } else { &host }))
         }
-        Event::Works { site, strategy } => LogEntry { kind: "works", text: format!("{site}: работает с «{strategy}»") },
-        Event::Switched { site, from, to } => {
-            LogEntry { kind: "switched", text: format!("{site}: не открывается с «{from}» → пробую «{to}»") }
+        Event::Works { site, strategy } => {
+            LogEntry { kind: "works", text: format!("{site}: работает с «{strategy}»"), site: Some(site) }
         }
-        Event::Warning(text) => LogEntry { kind: "warning", text },
+        Event::Switched { site, from, to } => LogEntry {
+            kind: "switched",
+            text: format!("{site}: не открывается с «{from}» → пробую «{to}»"),
+            site: Some(site),
+        },
+        Event::Warning(text) => LogEntry::new("warning", text),
     }
 }
 
@@ -197,7 +233,7 @@ fn tg_start_with(app: &AppHandle, state: &AppState) -> Result<TgStatus, String> 
         if slot.is_none() {
             let events = app.clone();
             let log: vx_tg::proxy::Log = std::sync::Arc::new(move |text| {
-                let _ = events.emit("vx-event", LogEntry { kind: "info", text });
+                let _ = events.emit("vx-event", LogEntry::new("info", text));
             });
             let options = vx_tg::proxy::Options { cloudflare: settings.tg_cloudflare, ..Default::default() };
             let proxy = vx_tg::Proxy::start(settings.tg_port, &settings.tg_secret, options, log)
@@ -261,7 +297,7 @@ fn start_engine(app: &AppHandle, state: &AppState, settings: &Settings) -> Resul
 fn stop_engine(app: &AppHandle, state: &AppState) -> Status {
     let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner()).take();
     let last = engine.map(Engine::stop).map(StatsDto::from).unwrap_or_default();
-    let status = Status { running: false, stats: last, doh_server: None };
+    let status = Status { running: false, stats: last, doh_server: None, uptime_secs: 0, sites: Vec::new() };
     let _ = app.emit("vx-status", &status);
     status
 }
@@ -273,6 +309,8 @@ impl AppState {
             running: engine.is_some(),
             stats: engine.as_ref().map(|e| e.stats().into()).unwrap_or_default(),
             doh_server: engine.as_ref().and_then(|e| e.doh_server.clone()),
+            uptime_secs: engine.as_ref().map_or(0, |e| e.uptime().as_secs()),
+            sites: engine.as_ref().map(|e| e.sites().into_iter().map(SiteDto::from).collect()).unwrap_or_default(),
         }
     }
 }
@@ -365,6 +403,33 @@ fn autostart_set(enabled: bool) -> Result<bool, String> {
     Ok(autostart_status())
 }
 
+/// Размеры окна: обычный режим помещается на экран 1366×768; мини-режим — узкая панель.
+/// Рамки Windows у окна нет, размер пользователь не меняет — только этой командой.
+const FULL_SIZE: (f64, f64) = (1200.0, 760.0);
+const MINI_SIZE: (f64, f64) = (340.0, 620.0);
+
+fn set_window_mode(window: &tauri::WebviewWindow, mini: bool) -> tauri::Result<()> {
+    let (w, h) = if mini { MINI_SIZE } else { FULL_SIZE };
+    window.set_size(tauri::LogicalSize::new(w, h))
+}
+
+/// Мини-режим и обратно; сам выбор окно сохраняет в настройках (`mini`).
+#[tauri::command]
+fn window_mode(window: tauri::WebviewWindow, mini: bool) -> Result<(), String> {
+    set_window_mode(&window, mini).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_minimize(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+/// Крестик в окне — как крестик Windows: окно прячется в трей, обход продолжает работать.
+#[tauri::command]
+fn window_hide(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
+}
+
 fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -394,7 +459,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 if running {
                     stop_engine(app, &state);
                 } else if let Err(e) = start_engine(app, &state, &read_settings(&state.dirs)) {
-                    let _ = app.emit("vx-event", LogEntry { kind: "warning", text: e });
+                    let _ = app.emit("vx-event", LogEntry::new("warning", e));
                     show_window(app);
                 }
             }
@@ -513,11 +578,20 @@ pub fn run() {
             tg_status,
             tg_start,
             tg_stop,
-            tg_open_link
+            tg_open_link,
+            window_mode,
+            window_minimize,
+            window_hide
         ])
         .setup(|app| {
             build_tray(app)?;
             let state = app.state::<AppState>();
+            if read_settings(&state.dirs).mini
+                && let Some(w) = app.get_webview_window("main")
+            {
+                let _ = set_window_mode(&w, true);
+                let _ = w.center();
+            }
             if read_settings(&state.dirs).telegram
                 && let Err(e) = tg_start_with(app.handle(), &state)
             {

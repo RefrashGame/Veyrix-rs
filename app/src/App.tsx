@@ -1,10 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react"
 import { listen } from "@tauri-apps/api/event"
+import {
+  PictureInPicture2,
+  Power,
+  ScrollText,
+  Send,
+  ServerCog,
+  Settings as SettingsIcon,
+  Stethoscope,
+  Waypoints,
+} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { MiniView } from "@/components/mini-view"
+import { ServiceMap, type MapSite, type Verdict } from "@/components/service-map"
+import { IconButton, WindowButtons } from "@/components/window-controls"
 import { isTauri, trackedInvoke as invoke } from "@/lib/tauri"
+import logo from "../src-tauri/icons/128x128.png"
 
 type Settings = {
   auto: boolean
@@ -15,6 +28,7 @@ type Settings = {
   tgPort: number
   tgSecret: string
   tgCloudflare: boolean
+  mini: boolean
 }
 
 type Stats = {
@@ -26,7 +40,7 @@ type Stats = {
   dohFallback: number
 }
 
-type Status = { running: boolean; stats: Stats; dohServer: string | null }
+type Status = { running: boolean; stats: Stats; dohServer: string | null; uptimeSecs: number; sites: MapSite[] }
 
 type LogKind = "site" | "works" | "switched" | "warning" | "info" | "error"
 type LogItem = { id: number; time: string; kind: LogKind; text: string }
@@ -51,16 +65,36 @@ const KIND_VARIANT: Record<LogKind, "default" | "secondary" | "destructive" | "o
   error: "destructive",
 }
 
+type Page = "overview" | "log" | "telegram" | "diag" | "dns" | "settings"
+
+const PAGES: { id: Page; title: string; icon: ComponentType<{ className?: string }>; group?: string }[] = [
+  { id: "overview", title: "Обзор", icon: Waypoints },
+  { id: "log", title: "Журнал", icon: ScrollText },
+  { id: "telegram", title: "Telegram", icon: Send },
+  { id: "diag", title: "Диагностика", icon: Stethoscope },
+  { id: "dns", title: "DNS Windows", icon: ServerCog, group: "Система" },
+  { id: "settings", title: "Настройки", icon: SettingsIcon },
+]
+
 function now() {
   return new Date().toLocaleTimeString("ru-RU")
 }
 
+function uptime(secs: number) {
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  return h > 0 ? `${h} ч ${m} мин` : m > 0 ? `${m} мин` : "меньше минуты"
+}
+
 export function App() {
+  const [page, setPage] = useState<Page>("overview")
   const [settings, setSettings] = useState<Settings | null>(null)
   const [status, setStatus] = useState<Status | null>(null)
+  const [tg, setTg] = useState<TgStatus | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [log, setLog] = useState<LogItem[]>([])
+  const [verdicts, setVerdicts] = useState<Record<string, Verdict>>({})
   const nextId = useRef(0)
 
   const addLog = useCallback((kind: LogKind, text: string) => {
@@ -71,7 +105,12 @@ export function App() {
     if (!isTauri()) return
     invoke<Settings>("load_settings").then(setSettings, (e) => setError(String(e)))
     invoke<Status>("engine_status").then(setStatus, () => {})
-    const unlisten = listen<{ kind: LogKind; text: string }>("vx-event", (e) => addLog(e.payload.kind, e.payload.text))
+    const unlisten = listen<{ kind: LogKind; text: string; site?: string }>("vx-event", (e) => {
+      const { kind, text, site } = e.payload
+      addLog(kind, text)
+      // Итог автоподбора по сайту — для отметки на карте.
+      if (site && (kind === "works" || kind === "switched")) setVerdicts((v) => ({ ...v, [site]: kind }))
+    })
     // Старт/стоп из трея или автозапуска — окно узнаёт новое состояние.
     const unlistenStatus = listen<Status>("vx-status", (e) => setStatus(e.payload))
     return () => {
@@ -89,6 +128,22 @@ export function App() {
     return () => clearInterval(timer)
   }, [status?.running])
 
+  // Секундный тик для карты: по нему она отсчитывает, давно ли рос трафик.
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    const timer = setInterval(() => setTick((t) => t + 1), 1000)
+    return () => clearInterval(timer)
+  }, [])
+
+  // Состояние Telegram-прокси для карты.
+  useEffect(() => {
+    if (!isTauri()) return
+    const poll = () => invoke<TgStatus>("tg_status").then(setTg, () => {})
+    poll()
+    const timer = setInterval(poll, 2000)
+    return () => clearInterval(timer)
+  }, [])
+
   async function toggle() {
     if (!settings) return
     setBusy(true)
@@ -101,6 +156,7 @@ export function App() {
       } else {
         const s = await invoke<Status>("engine_start", { settings })
         setStatus(s)
+        setVerdicts({})
         addLog("info", "Обход запущен")
       }
     } catch (e) {
@@ -128,126 +184,223 @@ export function App() {
 
   const running = status?.running ?? false
   const stats = status?.stats
+  const current = PAGES.find((p) => p.id === page)!
+
+  // Мини-режим: выбор сохраняется в настройках, размер окна меняет Rust (вручную окно не растягивается).
+  async function setMini(mini: boolean) {
+    await update({ mini })
+    invoke("window_mode", { mini }).catch((e) => setError(String(e)))
+  }
+
+  if (settings?.mini) {
+    return (
+      <MiniView
+        running={running}
+        busy={busy}
+        uptime={uptime(status?.uptimeSecs ?? 0)}
+        settings={settings}
+        dohServer={status?.dohServer ?? null}
+        stats={stats}
+        sites={status?.sites ?? []}
+        verdicts={verdicts}
+        tg={tg}
+        error={error}
+        onToggle={toggle}
+        onExpand={() => setMini(false)}
+      />
+    )
+  }
 
   return (
-    <div className="flex min-h-svh flex-col gap-4 p-6">
-      <header className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold tracking-tight">Veyrix</h1>
-        <Badge variant={running ? "default" : "outline"}>{running ? "Обход работает" : "Обход остановлен"}</Badge>
-      </header>
+    <div className="flex h-svh">
+      <Sidebar page={page} setPage={setPage} />
 
-      <Tabs defaultValue="overview" className="flex-1">
-        <TabsList>
-          <TabsTrigger value="overview">Обзор</TabsTrigger>
-          <TabsTrigger value="log">Журнал</TabsTrigger>
-          <TabsTrigger value="telegram">Telegram</TabsTrigger>
-          <TabsTrigger value="diag">Диагностика</TabsTrigger>
-          <TabsTrigger value="settings">Настройки</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="telegram" className="pt-4">
-          {settings && <Telegram settings={settings} update={update} />}
-        </TabsContent>
-
-        <TabsContent value="diag" className="pt-4">
-          <Diagnostics />
-        </TabsContent>
-
-        <TabsContent value="overview" className="flex flex-col gap-4 pt-4">
-          <div className="flex items-center gap-4">
-            <Button size="lg" variant={running ? "destructive" : "default"} disabled={busy || !settings} onClick={toggle}>
-              {running ? "Остановить" : "Запустить обход"}
-            </Button>
-            <p className="text-sm text-muted-foreground">
-              {settings &&
-                [
-                  settings.auto ? "автоподбор приёмов" : "приём по умолчанию",
-                  { fake: "QUIC: фейк", drop: "QUIC: выключен", pass: "QUIC: без изменений" }[settings.quic],
-                  settings.doh === "off" ? "обычный DNS" : `DNS через DoH (${status?.dohServer ?? settings.doh})`,
-                ].join(" · ")}
-            </p>
+      <div className="flex min-w-0 flex-1 flex-col py-5 pr-7 pl-2">
+        {/* Шапка — она же заголовок окна: за пустое место окно перетаскивается. */}
+        <header data-tauri-drag-region className="mb-4 flex items-center gap-3">
+          <h1 data-tauri-drag-region className="text-[21px] font-extrabold tracking-tight">
+            {current.title}
+          </h1>
+          <div data-tauri-drag-region className="h-10 flex-1" />
+          <div className="flex h-10 items-center gap-2.5 rounded-full border bg-[#141615] px-4 text-sm font-semibold">
+            <span
+              className={`size-2 rounded-full ${running ? "bg-primary shadow-[0_0_10px_var(--primary)]" : "bg-[#5d615e]"}`}
+            />
+            {running ? `Обход включён · ${uptime(status?.uptimeSecs ?? 0)}` : "Обход выключен"}
           </div>
-          {error && <p className="rounded-md border border-destructive/40 p-3 text-sm text-destructive">{error}</p>}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-            <Stat label="Соединений с приёмом" value={stats?.changed} />
-            <Stat label="Пропущено без изменений" value={stats?.passed} />
-            <Stat label="QUIC отброшено" value={stats?.dropped} />
-            <Stat label="DNS через DoH" value={stats?.dohOk} />
-            <Stat label="DNS обычным путём" value={stats?.dohFallback} />
-            <Stat label="Ошибок отправки" value={stats?.sendErrors} />
-          </div>
-          <p className="text-xs text-muted-foreground">
-            Крестик сворачивает окно в значок у часов — обход продолжает работать. Выйти — через меню значка.
-          </p>
-        </TabsContent>
+          <IconButton title="Мини-режим" icon={PictureInPicture2} onClick={() => setMini(true)} />
+          <Button
+            className="h-10 rounded-full px-5 font-bold"
+            variant={running ? "secondary" : "default"}
+            disabled={busy || !settings}
+            onClick={toggle}
+          >
+            <Power />
+            {running ? "Остановить" : "Запустить обход"}
+          </Button>
+          <div className="ml-1 h-6 w-px bg-border" />
+          <WindowButtons />
+        </header>
 
-        <TabsContent value="log" className="flex flex-col gap-3 pt-4">
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-muted-foreground">Последние {LOG_LIMIT} событий, новые сверху.</p>
-            <Button variant="outline" size="sm" onClick={() => setLog([])} disabled={log.length === 0}>
-              Очистить
-            </Button>
-          </div>
-          <ul className="flex flex-col gap-1 font-mono text-xs">
-            {log.length === 0 && <li className="text-muted-foreground">Пока пусто — запустите обход и откройте сайт.</li>}
-            {log.map((item) => (
-              <li key={item.id} className="flex items-baseline gap-2">
-                <span className="text-muted-foreground tabular-nums">{item.time}</span>
-                <Badge variant={KIND_VARIANT[item.kind]} className="shrink-0">
-                  {KIND_LABEL[item.kind]}
-                </Badge>
-                <span className="break-all">{item.text}</span>
-              </li>
-            ))}
-          </ul>
-        </TabsContent>
+        {error && (
+          <p className="mb-3 rounded-2xl border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
+        )}
 
-        <TabsContent value="settings" className="flex max-w-xl flex-col gap-5 pt-4 text-sm">
-          {!settings ? (
-            <p className="text-muted-foreground">Загрузка…</p>
-          ) : (
-            <>
-              {running && <p className="text-muted-foreground">Изменения применятся после перезапуска обхода.</p>}
-              <Autostart />
-              <Check
-                checked={settings.auto}
-                onChange={(auto) => update({ auto })}
-                title="Автоподбор приёма"
-                hint="Для каждого сайта свой приём; если сайт перестал открываться — программа сама пробует следующий."
-              />
-              <Choice
-                title="QUIC (HTTP/3)"
-                value={settings.quic}
-                onChange={(quic) => update({ quic: quic as Settings["quic"] })}
-                options={[
-                  ["fake", "Фейк перед QUIC"],
-                  ["drop", "Выключить QUIC — браузер перейдёт на обычный HTTPS"],
-                  ["pass", "Не трогать"],
-                ]}
-              />
-              <Choice
-                title="DNS"
-                value={settings.doh}
-                onChange={(doh) => update({ doh })}
-                options={[
-                  ["off", "Обычный DNS"],
-                  ["cloudflare", "DNS-over-HTTPS: Cloudflare"],
-                  ["google", "DNS-over-HTTPS: Google"],
-                  ["quad9", "DNS-over-HTTPS: Quad9"],
-                ]}
-              />
-              <Check
-                checked={settings.discordVoice}
-                onChange={(discordVoice) => update({ discordVoice })}
-                title="Обход для голоса Discord"
-                hint="Только если провайдер режет голосовые звонки: у части провайдеров это, наоборот, ломает голос."
-              />
-              <SystemDns />
-            </>
+        <div data-ui-scroll-container className="flex min-h-0 flex-1 flex-col">
+          {page === "overview" && (
+            <div className="flex min-h-full flex-col gap-3">
+              <div className="grid grid-cols-4 gap-3">
+                <Stat label="Соединений с приёмом" value={stats?.changed} />
+                <Stat label="Пропущено без изменений" value={stats?.passed} />
+                <Stat label="QUIC отброшено" value={stats?.dropped} />
+                <Stat label="DNS через DoH" value={stats?.dohOk} hint={stats?.dohFallback ? `обычным путём: ${stats.dohFallback}` : undefined} />
+              </div>
+              {(stats?.sendErrors ?? 0) > 0 && (
+                <p className="text-sm text-warning">Не отправлено пакетов: {stats?.sendErrors} — подробности в журнале.</p>
+              )}
+              {settings && (
+                <ServiceMap
+                  tick={tick}
+                  running={running}
+                  auto={settings.auto}
+                  quic={settings.quic}
+                  doh={settings.doh}
+                  dohServer={status?.dohServer ?? null}
+                  stats={stats}
+                  sites={status?.sites ?? []}
+                  verdicts={verdicts}
+                  tg={tg}
+                />
+              )}
+              <p className="text-xs text-muted-foreground">
+                Крестик сворачивает окно в значок у часов — обход продолжает работать. Выйти — через меню значка.
+              </p>
+            </div>
           )}
-        </TabsContent>
-      </Tabs>
+
+          {page === "log" && (
+            <Panel>
+              <div className="mb-3 flex items-center justify-between">
+                <p className="text-sm text-muted-foreground">Последние {LOG_LIMIT} событий, новые сверху.</p>
+                <Button variant="outline" size="sm" onClick={() => setLog([])} disabled={log.length === 0}>
+                  Очистить
+                </Button>
+              </div>
+              <ul className="flex flex-col gap-1.5 font-mono text-xs">
+                {log.length === 0 && <li className="text-muted-foreground">Пока пусто — запустите обход и откройте сайт.</li>}
+                {log.map((item) => (
+                  <li key={item.id} className="flex items-baseline gap-2">
+                    <span className="text-muted-foreground tabular-nums">{item.time}</span>
+                    <Badge variant={KIND_VARIANT[item.kind]} className="shrink-0">
+                      {KIND_LABEL[item.kind]}
+                    </Badge>
+                    <span className="ui-selectable break-all">{item.text}</span>
+                  </li>
+                ))}
+              </ul>
+            </Panel>
+          )}
+
+          {page === "telegram" && settings && (
+            <Panel narrow>
+              <Telegram settings={settings} update={update} status={tg} setStatus={setTg} />
+            </Panel>
+          )}
+
+          {page === "diag" && (
+            <Panel narrow>
+              <Diagnostics />
+            </Panel>
+          )}
+
+          {page === "dns" && (
+            <Panel narrow>
+              <SystemDns />
+            </Panel>
+          )}
+
+          {page === "settings" && (
+            <Panel narrow>
+              {!settings ? (
+                <p className="text-sm text-muted-foreground">Загрузка…</p>
+              ) : (
+                <div className="flex flex-col gap-5 text-sm">
+                  {running && <p className="text-muted-foreground">Изменения применятся после перезапуска обхода.</p>}
+                  <Autostart />
+                  <Check
+                    checked={settings.auto}
+                    onChange={(auto) => update({ auto })}
+                    title="Автоподбор приёма"
+                    hint="Для каждого сайта свой приём; если сайт перестал открываться — программа сама пробует следующий."
+                  />
+                  <Choice
+                    title="QUIC (HTTP/3)"
+                    value={settings.quic}
+                    onChange={(quic) => update({ quic: quic as Settings["quic"] })}
+                    options={[
+                      ["fake", "Фейк перед QUIC"],
+                      ["drop", "Выключить QUIC — браузер перейдёт на обычный HTTPS"],
+                      ["pass", "Не трогать"],
+                    ]}
+                  />
+                  <Choice
+                    title="DNS"
+                    value={settings.doh}
+                    onChange={(doh) => update({ doh })}
+                    options={[
+                      ["off", "Обычный DNS"],
+                      ["cloudflare", "DNS-over-HTTPS: Cloudflare"],
+                      ["google", "DNS-over-HTTPS: Google"],
+                      ["quad9", "DNS-over-HTTPS: Quad9"],
+                    ]}
+                  />
+                  <Check
+                    checked={settings.discordVoice}
+                    onChange={(discordVoice) => update({ discordVoice })}
+                    title="Обход для голоса Discord"
+                    hint="Только если провайдер режет голосовые звонки: у части провайдеров это, наоборот, ломает голос."
+                  />
+                </div>
+              )}
+            </Panel>
+          )}
+        </div>
+      </div>
     </div>
+  )
+}
+
+function Sidebar({ page, setPage }: { page: Page; setPage: (p: Page) => void }) {
+  return (
+    <aside className="m-3 flex w-[230px] shrink-0 flex-col gap-1 rounded-[22px] border border-sidebar-border bg-sidebar px-3 py-4">
+      <div data-tauri-drag-region className="flex items-center gap-3 px-2 pb-6">
+        <img src={logo} alt="" className="size-9 rounded-xl" />
+        <b className="text-xl font-extrabold tracking-tight">Veyrix</b>
+      </div>
+      {PAGES.map((p) => (
+        <div key={p.id} className="contents">
+          {p.group && <div className="px-3 pt-4 pb-1.5 text-xs font-semibold text-muted-foreground">{p.group}</div>}
+          <button
+            type="button"
+            onClick={() => setPage(p.id)}
+            className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-semibold transition-colors ${
+              page === p.id
+                ? "bg-sidebar-accent text-sidebar-accent-foreground [&_svg]:text-primary"
+                : "text-sidebar-foreground hover:bg-[#161817]"
+            }`}
+          >
+            <p.icon className="size-[18px]" />
+            {p.title}
+          </button>
+        </div>
+      ))}
+    </aside>
+  )
+}
+
+function Panel({ children, narrow }: { children: ReactNode; narrow?: boolean }) {
+  return (
+    <section className={`rounded-[22px] border bg-[#121413]/90 p-6 ${narrow ? "max-w-3xl" : ""}`}>{children}</section>
   )
 }
 
@@ -269,16 +422,16 @@ function mb(bytes: number) {
 }
 
 /// Telegram-прокси на 127.0.0.1: старт/стоп, ссылка для Telegram Desktop, маршруты.
-function Telegram(props: { settings: Settings; update: (patch: Partial<Settings>) => void }) {
-  const [status, setStatus] = useState<TgStatus | null>(null)
+/// Состояние опрашивает App (оно же нужно карте на «Обзоре»).
+function Telegram(props: {
+  settings: Settings
+  update: (patch: Partial<Settings>) => void
+  status: TgStatus | null
+  setStatus: (s: TgStatus) => void
+}) {
+  const { status, setStatus } = props
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    invoke<TgStatus>("tg_status").then(setStatus, () => {})
-    const timer = setInterval(() => invoke<TgStatus>("tg_status").then(setStatus, () => {}), 2000)
-    return () => clearInterval(timer)
-  }, [])
 
   async function run(command: "tg_start" | "tg_stop") {
     setBusy(true)
@@ -302,13 +455,13 @@ function Telegram(props: { settings: Settings; update: (patch: Partial<Settings>
 
   const running = status?.running ?? false
   return (
-    <div className="flex max-w-2xl flex-col gap-4 text-sm">
+    <div className="flex flex-col gap-4 text-sm">
       <p className="text-muted-foreground">
         Локальный прокси для Telegram Desktop: если провайдер блокирует Telegram, трафик идёт через веб-вход Telegram,
         резерв через Cloudflare или напрямую — что ответит первым. Обход DPI для этого не нужен.
       </p>
       <div className="flex flex-wrap items-center gap-3">
-        <Button variant={running ? "destructive" : "default"} disabled={busy} onClick={() => run(running ? "tg_stop" : "tg_start")}>
+        <Button variant={running ? "secondary" : "default"} disabled={busy} onClick={() => run(running ? "tg_stop" : "tg_start")}>
           {running ? "Остановить прокси" : "Запустить прокси"}
         </Button>
         <Button variant="outline" disabled={!running} onClick={connect}>
@@ -323,7 +476,7 @@ function Telegram(props: { settings: Settings; update: (patch: Partial<Settings>
             «Подключить Telegram» откроет ссылку — Telegram Desktop сам предложит включить прокси. Ссылка:{" "}
             <span className="font-mono break-all select-all">{status.link}</span>
           </p>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-4 gap-3">
             <Stat label="Соединений сейчас" value={status.active} />
             <Stat label="Через веб-вход" value={status.viaWs} />
             <Stat label="Через Cloudflare" value={status.viaCloudflare} />
@@ -374,7 +527,7 @@ function Diagnostics() {
   }
 
   return (
-    <div className="flex max-w-2xl flex-col gap-3 text-sm">
+    <div className="flex flex-col gap-3 text-sm">
       <div className="flex items-center gap-3">
         <Button onClick={run} disabled={busy}>
           {busy ? "Проверяю…" : "Проверить"}
@@ -383,7 +536,7 @@ function Diagnostics() {
       </div>
       <ul className="flex flex-col gap-2">
         {checks?.map((c) => (
-          <li key={c.name} className="rounded-md border p-3">
+          <li key={c.name} className="rounded-2xl bg-card p-3">
             <div className="flex items-center gap-2">
               <Badge variant={LEVEL[c.level].variant}>{LEVEL[c.level].label}</Badge>
               <span className="font-medium">{c.name}</span>
@@ -465,18 +618,22 @@ function SystemDns() {
   }
 
   return (
-    <section className="flex flex-col gap-2 border-t pt-4">
-      <span className="font-medium">DNS Windows</span>
-      <ul className="text-muted-foreground">
-        {state?.adapters.length === 0 && <li>Нет включённых адаптеров Ethernet или Wi-Fi.</li>}
+    <section className="flex flex-col gap-3 text-sm">
+      <p className="text-muted-foreground">
+        Системный DNS адаптеров Ethernet и Wi-Fi. Замена действует и без Veyrix; исходные настройки сохраняются, их
+        можно вернуть.
+      </p>
+      <ul className="flex flex-col gap-2">
+        {state?.adapters.length === 0 && <li className="text-muted-foreground">Нет включённых адаптеров Ethernet или Wi-Fi.</li>}
         {state?.adapters.map((a) => (
-          <li key={a.name}>
-            {a.name}: {a.dns ? a.dns.replaceAll(",", ", ") : "автоматически (DHCP)"}
+          <li key={a.name} className="flex justify-between gap-4 rounded-2xl bg-card px-4 py-3">
+            <span className="font-medium">{a.name}</span>
+            <span className="text-muted-foreground">{a.dns ? a.dns.replaceAll(",", ", ") : "автоматически (DHCP)"}</span>
           </li>
         ))}
       </ul>
       <div className="flex flex-wrap gap-2">
-        <Button variant="outline" disabled={busy || !state} onClick={apply}>
+        <Button disabled={busy || !state} onClick={apply}>
           Заменить на Яндекс ({state?.servers.join(", ") ?? "…"})
         </Button>
         <Button
@@ -493,11 +650,12 @@ function SystemDns() {
   )
 }
 
-function Stat({ label, value }: { label: string; value: number | undefined }) {
+function Stat({ label, value, hint }: { label: string; value: number | undefined; hint?: string }) {
   return (
-    <div className="rounded-lg border p-3">
-      <div className="text-2xl font-semibold tabular-nums">{value ?? 0}</div>
-      <div className="text-xs text-muted-foreground">{label}</div>
+    <div className="rounded-2xl border bg-[#141615]/85 px-4 py-3">
+      <div className="text-xs font-semibold text-muted-foreground">{label}</div>
+      <div className="mt-1 text-[22px] font-extrabold tabular-nums">{(value ?? 0).toLocaleString("ru-RU")}</div>
+      {hint && <div className="text-xs text-muted-foreground">{hint}</div>}
     </div>
   )
 }
@@ -524,7 +682,7 @@ function Choice(props: { title: string; value: string; onChange: (v: string) => 
     <label className="flex flex-col gap-1">
       <span className="font-medium">{props.title}</span>
       <select
-        className="rounded-md border bg-background px-3 py-2"
+        className="rounded-xl border bg-background px-3 py-2"
         value={props.value}
         onChange={(e) => props.onChange(e.target.value)}
       >
