@@ -107,6 +107,8 @@ jobs:
         run: |
           $version = $env:TAG.TrimStart('v')
           # Версия с суффиксом (0.2.0-beta) — предварительный выпуск: не становится «последним».
-          $pre = if ($version.Contains('-')) { @('--prerelease') } else { @() }
-          gh release create $env:TAG "dist/Veyrix-rs-$version-x64.zip" dist/SHA256SUMS.txt `
-            --draft --verify-tag @pre --title "Veyrix-rs $version" --notes-file "docs/releases/$env:TAG.md"
+          $ghArgs = @('release', 'create', $env:TAG, "dist/Veyrix-rs-$version-x64.zip", 'dist/SHA256SUMS.txt',
+            '--draft', '--verify-tag', '--title', "Veyrix-rs $version", '--notes-file', "docs/releases/$env:TAG.md")
+          if ($version.Contains('-')) { $ghArgs += '--prerelease' }
+          & gh @ghArgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
