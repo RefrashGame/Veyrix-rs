@@ -18,10 +18,12 @@ permissions:
 
 env:
   TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-  # Официальный WinDivert 2.2.2-A (basil00). DLL сверяется по хешу; у драйвера проверяется подпись Authenticode,
-  # хеши драйвера и архива печатаются в журнал — закрепить их здесь после первой сборки.
+  # Официальный WinDivert 2.2.2-A (basil00): архив и файлы сверяются по хешам, у драйвера ещё проверяется подпись.
+  # Драйвер в официальном архиве подписан компанией 成都密思听科技有限公司 (тот же файл, что и в zapret-win-bundle).
   WINDIVERT_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
+  WINDIVERT_ZIP_SHA256: 63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15
   WINDIVERT_DLL_SHA256: c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2
+  WINDIVERT_SYS_SHA256: 8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2
 
 jobs:
   release:
@@ -73,7 +75,9 @@ jobs:
           $sys = "$root/x64/WinDivert64.sys"
           "dll    $((Get-FileHash $dll).Hash.ToLower())"
           "sys    $((Get-FileHash $sys).Hash.ToLower())"
+          if ((Get-FileHash windivert.zip).Hash.ToLower() -ne $env:WINDIVERT_ZIP_SHA256) { throw "Архив WinDivert: хеш не совпадает с ожидаемым" }
           if ((Get-FileHash $dll).Hash.ToLower() -ne $env:WINDIVERT_DLL_SHA256) { throw "WinDivert.dll: хеш не совпадает с ожидаемым" }
+          if ((Get-FileHash $sys).Hash.ToLower() -ne $env:WINDIVERT_SYS_SHA256) { throw "WinDivert64.sys: хеш не совпадает с ожидаемым" }
           $sig = Get-AuthenticodeSignature $sys
           "подпись драйвера: $($sig.Status), $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "WinDivert64.sys: подпись недействительна ($($sig.Status))" }
