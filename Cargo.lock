@@ -4283,19 +4283,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vx"
-version = "0.1.0"
-dependencies = [
- "vx-core",
- "vx-diag",
- "vx-divert",
- "vx-doh",
- "vx-engine",
- "vx-sysdns",
- "vx-tg",
-]
-
-[[package]]
 name = "vx-core"
 version = "0.1.0"
 

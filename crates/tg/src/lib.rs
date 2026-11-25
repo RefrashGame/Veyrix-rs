@@ -7,7 +7,6 @@ pub mod cloudflare;
 pub mod crypto;
 pub mod mtproto;
 pub mod proxy;
-pub mod selftest;
 pub mod ws;
 
 pub use proxy::{Proxy, Stats};

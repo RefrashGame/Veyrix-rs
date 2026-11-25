@@ -45,7 +45,7 @@ pub fn question(p: &[u8]) -> Option<(String, u16)> {
     Some((labels.join("."), be16(p, at + 1)?))
 }
 
-/// Запрос с флагом рекурсии (для `vx doh`).
+/// Запрос с флагом рекурсии (для проверки DoH в диагностике).
 pub fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut p = id.to_be_bytes().to_vec();
     p.extend([0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]); // RD; один вопрос

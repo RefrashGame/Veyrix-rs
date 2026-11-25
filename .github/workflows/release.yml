@@ -1,6 +1,6 @@
 name: Release
 
-# Тег vX.Y.Z → проверки, сборка окна и консоли, пакет zip с WinDivert и черновик релиза.
+# Тег vX.Y.Z → проверки, сборка окна, пакет zip с WinDivert и черновик релиза.
 # Для уже созданного тега — запуск вручную (Actions → Release → Run workflow, tag = vX.Y.Z): код берётся из тега,
 # этот файл — из выбранной ветки.
 # Опубликовать черновик — кнопкой Publish на GitHub (или `gh release edit vX.Y.Z --draft=false`).
@@ -61,8 +61,6 @@ jobs:
           bun run lint
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           bun run tauri build --no-bundle
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo build --release -p vx
 
       - name: WinDivert
         shell: pwsh
@@ -89,7 +87,7 @@ jobs:
           $name = "Veyrix-rs-$version-x64"
           $dir = "dist/$name"
           New-Item -ItemType Directory -Force "$dir/engine", "$dir/licenses" | Out-Null
-          Copy-Item target/release/veyrix.exe, target/release/vx.exe $dir
+          Copy-Item target/release/veyrix.exe $dir
           Copy-Item "$env:WINDIVERT_DIR/x64/WinDivert.dll", "$env:WINDIVERT_DIR/x64/WinDivert64.sys" "$dir/engine"
           Copy-Item README.md, LICENSE, THIRD-PARTY-LICENSES.md $dir
           Copy-Item "$env:WINDIVERT_DIR/LICENSE" "$dir/licenses/WinDivert-LICENSE.txt"
