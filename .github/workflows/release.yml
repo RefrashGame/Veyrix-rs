@@ -1,19 +1,27 @@
 name: Release
 
 # Тег vX.Y.Z → проверки, сборка окна и консоли, пакет zip с WinDivert и черновик релиза.
+# Для уже созданного тега — запуск вручную (Actions → Release → Run workflow, tag = vX.Y.Z): код берётся из тега,
+# этот файл — из выбранной ветки.
 # Опубликовать черновик — кнопкой Publish на GitHub (или `gh release edit vX.Y.Z --draft=false`).
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза (например, v0.1.0)'
+        required: true
 
 permissions:
   contents: write
 
 env:
-  # WinDivert берётся с официального релиза basil00; файлы сверяются с хешами ниже — те же, что проверены в работе.
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  # Официальный WinDivert 2.2.2-A (basil00). DLL сверяется по хешу; у драйвера проверяется подпись Authenticode,
+  # хеши драйвера и архива печатаются в журнал — закрепить их здесь после первой сборки.
   WINDIVERT_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
-  WINDIVERT_DLL_SHA256: 16abd6a029e65557c6a309bea7b13bf81fff4e193567582e1cddbf6719f323e0
-  WINDIVERT_SYS_SHA256: 8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2
+  WINDIVERT_DLL_SHA256: c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2
 
 jobs:
   release:
@@ -21,11 +29,13 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Version matches tag
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $tag = $env:TAG.TrimStart('v')
           $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
           $npm = (Get-Content app/package.json -Raw | ConvertFrom-Json).version
           $tauri = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
@@ -58,18 +68,24 @@ jobs:
         shell: pwsh
         run: |
           Invoke-WebRequest $env:WINDIVERT_URL -OutFile windivert.zip
+          "архив  $((Get-FileHash windivert.zip).Hash.ToLower())"
           Expand-Archive windivert.zip -DestinationPath windivert
-          $root = Get-ChildItem windivert -Directory | Select-Object -First 1
-          foreach ($f in @(@("x64/WinDivert.dll", $env:WINDIVERT_DLL_SHA256), @("x64/WinDivert64.sys", $env:WINDIVERT_SYS_SHA256))) {
-            $hash = (Get-FileHash (Join-Path $root.FullName $f[0]) -Algorithm SHA256).Hash.ToLower()
-            if ($hash -ne $f[1]) { throw "$($f[0]): SHA256 $hash не совпадает с ожидаемым" }
-          }
-          "WINDIVERT_DIR=$($root.FullName)" >> $env:GITHUB_ENV
+          $root = (Get-ChildItem windivert -Directory | Select-Object -First 1).FullName
+          $dll = "$root/x64/WinDivert.dll"
+          $sys = "$root/x64/WinDivert64.sys"
+          "dll    $((Get-FileHash $dll).Hash.ToLower())"
+          "sys    $((Get-FileHash $sys).Hash.ToLower())"
+          if ((Get-FileHash $dll).Hash.ToLower() -ne $env:WINDIVERT_DLL_SHA256) { throw "WinDivert.dll: хеш не совпадает с ожидаемым" }
+          $sig = Get-AuthenticodeSignature $sys
+          "подпись драйвера: $($sig.Status), $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "WinDivert64.sys: подпись недействительна ($($sig.Status))" }
+          if (-not (Test-Path "$root/LICENSE")) { throw "В архиве WinDivert нет LICENSE" }
+          "WINDIVERT_DIR=$root" >> $env:GITHUB_ENV
 
       - name: Package
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = $env:TAG.TrimStart('v')
           $name = "Veyrix-rs-$version-x64"
           $dir = "dist/$name"
           New-Item -ItemType Directory -Force "$dir/engine", "$dir/licenses" | Out-Null
@@ -87,7 +103,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag.TrimStart('v')
-          gh release create $tag "dist/Veyrix-rs-$version-x64.zip" dist/SHA256SUMS.txt `
-            --draft --title "Veyrix-rs $version" --notes-file "docs/releases/$tag.md"
+          $version = $env:TAG.TrimStart('v')
+          gh release create $env:TAG "dist/Veyrix-rs-$version-x64.zip" dist/SHA256SUMS.txt `
+            --draft --verify-tag --title "Veyrix-rs $version" --notes-file "docs/releases/$env:TAG.md"
