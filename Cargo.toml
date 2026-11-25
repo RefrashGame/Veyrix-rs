@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/divert", "crates/doh", "crates/engine", "crates/sysdns", "crates/diag", "crates/tg", "crates/cli", "app/src-tauri"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 # Ниже не опускать: resolver 3 подбирает зависимости под эту версию (с 1.85 брал старый Tauri, не совпадавший с npm).
 rust-version = "1.100"

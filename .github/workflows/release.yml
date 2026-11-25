@@ -1,0 +1,93 @@
+name: Release
+
+# Тег vX.Y.Z → проверки, сборка окна и консоли, пакет zip с WinDivert и черновик релиза.
+# Опубликовать черновик — кнопкой Publish на GitHub (или `gh release edit vX.Y.Z --draft=false`).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  # WinDivert берётся с официального релиза basil00; файлы сверяются с хешами ниже — те же, что проверены в работе.
+  WINDIVERT_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
+  WINDIVERT_DLL_SHA256: 16abd6a029e65557c6a309bea7b13bf81fff4e193567582e1cddbf6719f323e0
+  WINDIVERT_SYS_SHA256: 8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version matches tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $npm = (Get-Content app/package.json -Raw | ConvertFrom-Json).version
+          $tauri = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($cargo -ne $tag -or $npm -ne $tag -or $tauri -ne $tag) {
+            throw "Тег $tag, а версии: Cargo.toml $cargo, package.json $npm, tauri.conf.json $tauri"
+          }
+          if (-not (Test-Path "docs/releases/v$tag.md")) { throw "Нет описания релиза docs/releases/v$tag.md" }
+
+      - run: rustup component add clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+
+      - name: Build
+        shell: pwsh
+        working-directory: app
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          bun run lint
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          bun run tauri build --no-bundle
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --release -p vx
+
+      - name: WinDivert
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:WINDIVERT_URL -OutFile windivert.zip
+          Expand-Archive windivert.zip -DestinationPath windivert
+          $root = Get-ChildItem windivert -Directory | Select-Object -First 1
+          foreach ($f in @(@("x64/WinDivert.dll", $env:WINDIVERT_DLL_SHA256), @("x64/WinDivert64.sys", $env:WINDIVERT_SYS_SHA256))) {
+            $hash = (Get-FileHash (Join-Path $root.FullName $f[0]) -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $f[1]) { throw "$($f[0]): SHA256 $hash не совпадает с ожидаемым" }
+          }
+          "WINDIVERT_DIR=$($root.FullName)" >> $env:GITHUB_ENV
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $name = "Veyrix-rs-$version-x64"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force "$dir/engine", "$dir/licenses" | Out-Null
+          Copy-Item target/release/veyrix.exe, target/release/vx.exe $dir
+          Copy-Item "$env:WINDIVERT_DIR/x64/WinDivert.dll", "$env:WINDIVERT_DIR/x64/WinDivert64.sys" "$dir/engine"
+          Copy-Item README.md, LICENSE, THIRD-PARTY-LICENSES.md $dir
+          Copy-Item "$env:WINDIVERT_DIR/LICENSE" "$dir/licenses/WinDivert-LICENSE.txt"
+          Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          gh release create $tag "dist/Veyrix-rs-$version-x64.zip" dist/SHA256SUMS.txt `
+            --draft --title "Veyrix-rs $version" --notes-file "docs/releases/$tag.md"
