@@ -13,3 +13,4 @@ vx-doh = { path = "../doh" }
 vx-engine = { path = "../engine" }
 vx-sysdns = { path = "../sysdns" }
 vx-diag = { path = "../diag" }
+vx-tg = { path = "../tg" }

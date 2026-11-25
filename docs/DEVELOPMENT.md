@@ -67,6 +67,16 @@ target\release\vx.exe run --auto-test               # все сайты начи
 В консоли: «сайт: работает с «приём»» и «сайт: не открывается с «A» → пробую «B»». Выбор — `data\tuning.txt`
 рядом с `vx.exe` (`--auto-test` его не читает, но перезаписывает).
 
+## Telegram-прокси (администратор не нужен)
+
+```powershell
+target\release\vx.exe tg                                  # прокси на 127.0.0.1:1443 и ссылка tg://proxy для Telegram Desktop
+target\release\vx.exe tg selftest                         # req_pq через прокси к DC 2, 4, 1, 3, 5
+target\release\vx.exe tg selftest --no-direct --no-tcp    # то же только через Cloudflare
+```
+
+В окне — вкладка «Telegram». Secret создаётся при первом запуске и хранится в `data\settings.json`.
+
 ## Диагностика, трей, автозапуск
 
 ```powershell

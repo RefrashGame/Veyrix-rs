@@ -11,6 +11,10 @@ type Settings = {
   quic: "fake" | "drop" | "pass"
   doh: string
   discordVoice: boolean
+  telegram: boolean
+  tgPort: number
+  tgSecret: string
+  tgCloudflare: boolean
 }
 
 type Stats = {
@@ -136,9 +140,14 @@ export function App() {
         <TabsList>
           <TabsTrigger value="overview">Обзор</TabsTrigger>
           <TabsTrigger value="log">Журнал</TabsTrigger>
+          <TabsTrigger value="telegram">Telegram</TabsTrigger>
           <TabsTrigger value="diag">Диагностика</TabsTrigger>
           <TabsTrigger value="settings">Настройки</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="telegram" className="pt-4">
+          {settings && <Telegram settings={settings} update={update} />}
+        </TabsContent>
 
         <TabsContent value="diag" className="pt-4">
           <Diagnostics />
@@ -238,6 +247,106 @@ export function App() {
           )}
         </TabsContent>
       </Tabs>
+    </div>
+  )
+}
+
+type TgStatus = {
+  running: boolean
+  port: number
+  link: string
+  active: number
+  viaWs: number
+  viaCloudflare: number
+  viaTcp: number
+  up: number
+  down: number
+  badHandshakes: number
+}
+
+function mb(bytes: number) {
+  return `${(bytes / 1024 / 1024).toFixed(1)} МБ`
+}
+
+/// Telegram-прокси на 127.0.0.1: старт/стоп, ссылка для Telegram Desktop, маршруты.
+function Telegram(props: { settings: Settings; update: (patch: Partial<Settings>) => void }) {
+  const [status, setStatus] = useState<TgStatus | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    invoke<TgStatus>("tg_status").then(setStatus, () => {})
+    const timer = setInterval(() => invoke<TgStatus>("tg_status").then(setStatus, () => {}), 2000)
+    return () => clearInterval(timer)
+  }, [])
+
+  async function run(command: "tg_start" | "tg_stop") {
+    setBusy(true)
+    setError(null)
+    try {
+      setStatus(await invoke<TgStatus>(command))
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function connect() {
+    try {
+      await invoke("tg_open_link")
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const running = status?.running ?? false
+  return (
+    <div className="flex max-w-2xl flex-col gap-4 text-sm">
+      <p className="text-muted-foreground">
+        Локальный прокси для Telegram Desktop: если провайдер блокирует Telegram, трафик идёт через веб-вход Telegram,
+        резерв через Cloudflare или напрямую — что ответит первым. Обход DPI для этого не нужен.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        <Button variant={running ? "destructive" : "default"} disabled={busy} onClick={() => run(running ? "tg_stop" : "tg_start")}>
+          {running ? "Остановить прокси" : "Запустить прокси"}
+        </Button>
+        <Button variant="outline" disabled={!running} onClick={connect}>
+          Подключить Telegram
+        </Button>
+        <Badge variant={running ? "default" : "outline"}>{running ? `127.0.0.1:${status?.port}` : "Прокси остановлен"}</Badge>
+      </div>
+      {error && <p className="text-destructive">{error}</p>}
+      {running && status && (
+        <>
+          <p className="text-muted-foreground">
+            «Подключить Telegram» откроет ссылку — Telegram Desktop сам предложит включить прокси. Ссылка:{" "}
+            <span className="font-mono break-all select-all">{status.link}</span>
+          </p>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <Stat label="Соединений сейчас" value={status.active} />
+            <Stat label="Через веб-вход" value={status.viaWs} />
+            <Stat label="Через Cloudflare" value={status.viaCloudflare} />
+            <Stat label="Напрямую" value={status.viaTcp} />
+          </div>
+          <p className="text-muted-foreground">
+            Передано: {mb(status.up)} ↑ · {mb(status.down)} ↓
+            {status.badHandshakes > 0 && " · были подключения с неверным ключом — подключите Telegram заново"}
+          </p>
+        </>
+      )}
+      <Check
+        checked={props.settings.tgCloudflare}
+        onChange={(tgCloudflare) => props.update({ tgCloudflare })}
+        title="Резерв через Cloudflare (серверы Flowseal)"
+        hint="Если серверы Telegram заблокированы по IP. Посредник видит факт подключения, но не переписку: трафик зашифрован Telegram."
+      />
+      <Check
+        checked={props.settings.telegram}
+        onChange={(telegram) => props.update({ telegram })}
+        title="Запускать прокси вместе с Veyrix"
+        hint="Изменения порта и резерва применятся после перезапуска прокси."
+      />
     </div>
   )
 }

@@ -22,11 +22,27 @@ struct Settings {
     doh: String,
     /// Фейки перед голосом Discord.
     discord_voice: bool,
+    /// Запускать Telegram-прокси вместе с Veyrix.
+    telegram: bool,
+    tg_port: u16,
+    /// Secret прокси (32 hex); создаётся при первом запуске. Прокси слушает только 127.0.0.1.
+    tg_secret: String,
+    /// Резерв через Cloudflare-домены Flowseal.
+    tg_cloudflare: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto: true, quic: "fake".into(), doh: "off".into(), discord_voice: false }
+        Self {
+            auto: true,
+            quic: "fake".into(),
+            doh: "off".into(),
+            discord_voice: false,
+            telegram: false,
+            tg_port: 1443,
+            tg_secret: String::new(),
+            tg_cloudflare: true,
+        }
     }
 }
 
@@ -127,8 +143,97 @@ impl Dirs {
 struct AppState {
     dirs: Dirs,
     engine: Mutex<Option<Engine>>,
+    telegram: Mutex<Option<vx_tg::Proxy>>,
     /// Запуск из автозапуска: окно не показывается, обход стартует сам.
     autostart: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TgStatus {
+    running: bool,
+    port: u16,
+    link: String,
+    active: usize,
+    via_ws: u64,
+    via_cloudflare: u64,
+    via_tcp: u64,
+    up: u64,
+    down: u64,
+    bad_handshakes: u64,
+}
+
+fn tg_status_of(state: &AppState) -> TgStatus {
+    use std::sync::atomic::Ordering::Relaxed;
+    let settings = read_settings(&state.dirs);
+    let guard = state.telegram.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(proxy) = guard.as_ref() else { return TgStatus { port: settings.tg_port, ..TgStatus::default() } };
+    let s = proxy.stats();
+    TgStatus {
+        running: true,
+        port: proxy.port(),
+        link: vx_tg::mtproto::telegram_link(proxy.port(), &settings.tg_secret),
+        active: s.active.load(Relaxed),
+        via_ws: s.via_ws.load(Relaxed),
+        via_cloudflare: s.via_cloudflare.load(Relaxed),
+        via_tcp: s.via_tcp.load(Relaxed),
+        up: s.up.load(Relaxed),
+        down: s.down.load(Relaxed),
+        bad_handshakes: s.bad_handshakes.load(Relaxed),
+    }
+}
+
+/// Запуск прокси; secret создаётся и сохраняется при первом запуске (тот же нужен Telegram в ссылке).
+fn tg_start_with(app: &AppHandle, state: &AppState) -> Result<TgStatus, String> {
+    let mut settings = read_settings(&state.dirs);
+    if vx_tg::mtproto::parse_secret(&settings.tg_secret).is_none() {
+        settings.tg_secret = vx_tg::mtproto::new_secret();
+        std::fs::create_dir_all(&state.dirs.data).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        std::fs::write(state.dirs.settings_file(), json).map_err(|e| e.to_string())?;
+    }
+    {
+        let mut slot = state.telegram.lock().map_err(|e| e.to_string())?;
+        if slot.is_none() {
+            let events = app.clone();
+            let log: vx_tg::proxy::Log = std::sync::Arc::new(move |text| {
+                let _ = events.emit("vx-event", LogEntry { kind: "info", text });
+            });
+            let options = vx_tg::proxy::Options { cloudflare: settings.tg_cloudflare, ..Default::default() };
+            let proxy = vx_tg::Proxy::start(settings.tg_port, &settings.tg_secret, options, log)
+                .map_err(|e| format!("Telegram-прокси, порт {}: {e}", settings.tg_port))?;
+            *slot = Some(proxy);
+        }
+    }
+    Ok(tg_status_of(state))
+}
+
+#[tauri::command]
+fn tg_status(state: State<AppState>) -> TgStatus {
+    tg_status_of(&state)
+}
+
+#[tauri::command(async)]
+fn tg_start(app: AppHandle, state: State<AppState>) -> Result<TgStatus, String> {
+    tg_start_with(&app, &state)
+}
+
+#[tauri::command(async)]
+fn tg_stop(state: State<AppState>) -> TgStatus {
+    if let Some(proxy) = state.telegram.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        proxy.stop();
+    }
+    tg_status_of(&state)
+}
+
+/// Открыть ссылку tg://proxy — Telegram Desktop сам предложит подключиться.
+#[tauri::command]
+fn tg_open_link(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let status = tg_status_of(&state);
+    if !status.running {
+        return Err("Сначала запустите прокси".into());
+    }
+    app.opener().open_url(status.link, None::<&str>).map_err(|e| e.to_string())
 }
 
 fn read_settings(dirs: &Dirs) -> Settings {
@@ -378,6 +483,8 @@ fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
 pub fn run() {
     use tauri_plugin_log::{Target, TargetKind};
     tauri::Builder::default()
+        // Первым: повторный запуск (в том числе из автозапуска) только показывает уже открытое окно и завершается.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([Target::new(TargetKind::Stdout), Target::new(TargetKind::LogDir { file_name: None })])
@@ -388,6 +495,7 @@ pub fn run() {
         .manage(AppState {
             dirs: Dirs::near_exe(),
             engine: Mutex::new(None),
+            telegram: Mutex::new(None),
             autostart: std::env::args().any(|a| a == AUTOSTART_ARG),
         })
         .invoke_handler(tauri::generate_handler![
@@ -401,11 +509,20 @@ pub fn run() {
             sysdns_restore,
             diagnostics,
             autostart_status,
-            autostart_set
+            autostart_set,
+            tg_status,
+            tg_start,
+            tg_stop,
+            tg_open_link
         ])
         .setup(|app| {
             build_tray(app)?;
             let state = app.state::<AppState>();
+            if read_settings(&state.dirs).telegram
+                && let Err(e) = tg_start_with(app.handle(), &state)
+            {
+                log::error!("Telegram-прокси: {e}");
+            }
             if state.autostart {
                 // При входе в Windows: обход с сохранёнными настройками, окно скрыто (значок в трее).
                 if let Err(e) = start_engine(app.handle(), &state, &read_settings(&state.dirs)) {

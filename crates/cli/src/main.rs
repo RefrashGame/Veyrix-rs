@@ -21,6 +21,12 @@
 //!     --doh cloudflare        DNS через DNS-over-HTTPS: cloudflare, google, quad9 или https://…; если DoH не ответил —
 //!                             запрос уходит обычному DNS как раньше
 //!
+//! vx tg [--port 1443] [--secret HEX] [--no-direct] [--no-cloudflare] [--seconds N]
+//!     Telegram-прокси на 127.0.0.1: печатает ссылку tg://proxy для Telegram Desktop. Маршрут: веб-вход Telegram,
+//!     при молчании — резерв через Cloudflare (Flowseal), иначе прямой TCP. Не требует администратора.
+//! vx tg selftest [--no-direct] [--no-cloudflare] [--no-tcp]   (--no-direct --no-tcp — проверить только Cloudflare)
+//!     Сквозная проверка: req_pq через прокси к DC 2, 4, 1, 3, 5 (как первый запрос Telegram). Ничего не меняет.
+//!
 //! vx diag [--engine ПАПКА]
 //!     Диагностика: права, WinDivert, служба BFE, другие перехватчики, VPN, прокси, DoH. Только чтение.
 //!
@@ -58,6 +64,7 @@ fn main() -> ExitCode {
         Some("doh") => doh_test(&args[1..]),
         Some("sysdns") => sysdns(&args[1..]),
         Some("diag") => diag(&args[1..]),
+        Some("tg") => tg(&args[1..]),
         _ => {
             eprintln!("Использование: vx sniff | vx run [приёмы] — подробности в docs/DEVELOPMENT.md");
             return ExitCode::from(2);
@@ -234,6 +241,46 @@ fn run(args: &[String]) -> Result<(), String> {
     if s.doh_ok + s.doh_fallback > 0 {
         println!("DNS: через DoH {}, обычным DNS (DoH не ответил) {}.", s.doh_ok, s.doh_fallback);
     }
+    Ok(())
+}
+
+fn tg(args: &[String]) -> Result<(), String> {
+    use vx_tg::{Proxy, mtproto, proxy::Options};
+    let options = Options {
+        direct_ws: !args.iter().any(|a| a == "--no-direct"),
+        cloudflare: !args.iter().any(|a| a == "--no-cloudflare"),
+        direct_tcp: !args.iter().any(|a| a == "--no-tcp"),
+    };
+    let log: vx_tg::proxy::Log = Arc::new(|message| println!("  {message}"));
+
+    if args.first().map(String::as_str) == Some("selftest") {
+        let secret = mtproto::new_secret();
+        let proxy = Proxy::start(0, &secret, options, log).map_err(|e| e.to_string())?;
+        let key = mtproto::parse_secret(&secret).expect("новый secret корректен");
+        for dc in [2i16, 4, 1, 3, 5] {
+            match vx_tg::selftest::req_pq(proxy.port(), &key, dc) {
+                Ok(t) => println!("ок   DC{dc}: resPQ за {} мс", t.as_millis()),
+                Err(e) => println!("ОШИБ DC{dc}: {e}"),
+            }
+        }
+        let s = proxy.stats();
+        let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        println!("Маршруты: веб-вход Telegram {}, Cloudflare {}, прямой TCP {}.", get(&s.via_ws), get(&s.via_cloudflare), get(&s.via_tcp));
+        return Ok(());
+    }
+
+    let port = option(args, "--port").map(|p| p.parse::<u16>().map_err(|_| format!("--port: не число «{p}»"))).transpose()?.unwrap_or(1443);
+    let secret = option(args, "--secret").unwrap_or_else(mtproto::new_secret);
+    let proxy = Proxy::start(port, &secret, options, log).map_err(|e| format!("порт {port}: {e}"))?;
+    println!("Ссылка для Telegram Desktop (откройте её — Telegram сам предложит подключиться):");
+    println!("  {}", mtproto::telegram_link(proxy.port(), &secret));
+    match seconds(args)? {
+        Some(s) => std::thread::sleep(Duration::from_secs(s)),
+        None => loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        },
+    }
+    proxy.stop();
     Ok(())
 }
 
