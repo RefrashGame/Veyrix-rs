@@ -1,6 +1,6 @@
 [package]
 name = "vx-engine"
-description = "Движок Veyrix-rs: перехват, приёмы обхода, DoH и автоподбор — общий для консоли и окна"
+description = "Движок Veyrix-rs: перехват, приёмы обхода, DoH, автоподбор и обход блокировки по IP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,4 @@ publish.workspace = true
 vx-core = { path = "../core" }
 vx-divert = { path = "../divert" }
 vx-doh = { path = "../doh" }
+vx-reroute = { path = "../reroute" }

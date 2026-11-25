@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use vx_core::desync::corrupt_tcp_checksum;
 use vx_core::dns;
 use vx_core::packet::{TCP_FIN, TCP_RST};
-use vx_core::tuner::{Tracker, Tuner, passthrough, presets, site_key};
+use vx_core::tuner::{PASSTHROUGH, Tracker, Tuner, presets, site_key};
 use vx_core::{Action, Proto, QuicMode, Strategy, Transport, apply, classify, parse};
 use vx_divert::{Divert, FLAG_SNIFF};
 use vx_doh::Doh;
 
 pub use vx_core;
+pub use vx_reroute::{Mode as RerouteMode, Proxy};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -31,6 +32,8 @@ pub struct Config {
     pub auto_test: bool,
     /// DoH-сервер: cloudflare, google, quad9 или https://…; `None` — обычный DNS.
     pub doh: Option<String>,
+    /// Обход блокировки по IP; `None` — выключен.
+    pub reroute: Option<vx_reroute::Mode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,8 @@ pub enum Event {
     Switched { site: String, from: String, to: String },
     /// Не отправлен пакет и т. п. — обход продолжается.
     Warning(String),
+    /// Обход блокировки по IP: адрес не отвечает и куда уходят его соединения.
+    Reroute(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -53,6 +58,10 @@ pub struct Stats {
     pub send_errors: u64,
     pub doh_ok: u64,
     pub doh_fallback: u64,
+    /// Адресов с блокировкой по IP, которые обходятся.
+    pub ip_blocked: u64,
+    /// Соединений, ушедших в обход блокировки по IP.
+    pub ip_rerouted: u64,
 }
 
 #[derive(Default)]
@@ -181,6 +190,7 @@ pub struct Engine {
     pub doh_server: Option<String>,
     /// Файл выбора автоподбора, если автоподбор включён.
     pub tuning_file: Option<PathBuf>,
+    reroute: Option<vx_reroute::Reroute>,
 }
 
 impl Engine {
@@ -195,6 +205,15 @@ impl Engine {
 
     pub fn start(config: Config, sink: Sink) -> Result<Self, String> {
         Self::check(&config)?;
+        // Обход блокировки по IP — первым: его ошибка (например, WARP не запущен) не оставит открытых перехватов.
+        let reroute = match config.reroute.clone() {
+            Some(mode) => {
+                let sink = Arc::clone(&sink);
+                let log: vx_reroute::Log = Arc::new(move |text| sink(Event::Reroute(text)));
+                Some(vx_reroute::Reroute::start(&config.engine_dir, mode, log)?)
+            }
+            None => None,
+        };
         let counters = Arc::new(Counters::default());
         let sites = Arc::new(Sites::new());
         let main = Arc::new(Divert::open(&config.engine_dir, &run_filter(&config.strategy), 0, 0).map_err(|e| e.to_string())?);
@@ -218,7 +237,7 @@ impl Engine {
 
         let (strategy, c, s) = (config.strategy.clone(), Arc::clone(&counters), Arc::clone(&sites));
         let main_thread = std::thread::spawn(move || packet_loop(&main, &strategy, auto.as_ref(), &c, &s, &sink));
-        Ok(Self { handles, main: Some(main_thread), counters, sites, doh_server, tuning_file })
+        Ok(Self { handles, main: Some(main_thread), counters, sites, doh_server, tuning_file, reroute })
     }
 
     pub fn stats(&self) -> Stats {
@@ -231,6 +250,8 @@ impl Engine {
             send_errors: get(&c.send_errors),
             doh_ok: get(&c.doh_ok),
             doh_fallback: get(&c.doh_fallback),
+            ip_blocked: self.reroute.as_ref().map_or(0, |r| r.stats().0),
+            ip_rerouted: self.reroute.as_ref().map_or(0, |r| r.stats().1),
         }
     }
 
@@ -250,6 +271,7 @@ impl Engine {
     }
 
     fn shutdown(&mut self) {
+        self.reroute.take();
         for h in &self.handles {
             let _ = h.shutdown();
         }
@@ -350,10 +372,9 @@ struct Auto {
 
 impl Auto {
     fn start(config: &Config, sink: Sink) -> Result<Self, String> {
-        let mut list = presets();
-        if config.auto_test {
-            list.insert(0, ("без приёмов", passthrough()));
-        }
+        let list = presets();
+        // Обычно сайты начинают с первого приёма; `auto_test` — с «без приёмов», чтобы увидеть самовосстановление.
+        let start = if config.auto_test { list.iter().position(|(n, _)| *n == PASSTHROUGH).unwrap_or(0) } else { 0 };
         // QUIC и голос Discord — общие настройки, автоподбор меняет только приёмы для TLS.
         let global = &config.strategy;
         let strategies: Vec<Strategy> = list
@@ -362,7 +383,7 @@ impl Auto {
             .collect();
         let names: Vec<&'static str> = list.iter().map(|(n, _)| *n).collect();
         let file = config.data_dir.join("tuning.txt");
-        let mut tuner = Tuner::new(names.len(), 0);
+        let mut tuner = Tuner::new(names.len(), start);
         if !config.auto_test
             && let Ok(text) = std::fs::read_to_string(&file)
         {

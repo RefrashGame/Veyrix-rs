@@ -1,0 +1,10 @@
+[package]
+name = "vx-reroute"
+description = "Veyrix-rs: обход блокировки по IP — другой адрес Cloudflare, свой SOCKS5-прокси или Cloudflare WARP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+vx-divert = { path = "../divert" }

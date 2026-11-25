@@ -11,7 +11,12 @@ use crate::desync::{Fooling, SplitPos, Strategy};
 /// Неудач подряд до смены приёма: одна — бывает и без DPI (сайт моргнул).
 const FAILS_TO_SWITCH: u8 = 2;
 
+/// Название приёма «без приёмов» в списке автоподбора.
+pub const PASSTHROUGH: &str = "без приёмов";
+
 /// Приёмы, которые перебирает автоподбор, по порядку. Первый — проверенный на практике вариант по умолчанию.
+/// Последний — «без приёмов»: у части провайдеров сайт не заблокирован, а приёмы сами ломают соединение
+/// (Discord на Билайне, Калининград, 2026-11-25) — тогда автоподбор доходит до прямого соединения и запоминает его.
 pub fn presets() -> Vec<(&'static str, Strategy)> {
     let base = Strategy::default();
     vec![
@@ -25,10 +30,11 @@ pub fn presets() -> Vec<(&'static str, Strategy)> {
             ..base.clone()
         }),
         ("только разрезание", Strategy { fake: false, ..base }),
+        (PASSTHROUGH, passthrough()),
     ]
 }
 
-/// «Без приёмов» — для проверки самовосстановления: заблокированный сайт должен сам перейти на рабочий приём.
+/// «Без приёмов»: пакеты уходят как есть. Последний в списке автоподбора; с него же начинает `--auto-test`.
 pub fn passthrough() -> Strategy {
     Strategy { fake: false, split: vec![], disorder: false, ..Strategy::default() }
 }
@@ -401,6 +407,20 @@ mod tests {
         gap.feed(1000, &rec[..10]);
         gap.feed(1050, &rec[50..]); // пропуск — границы записей потеряны, обрыв больше не утверждаем
         assert!(!gap.incomplete());
+    }
+
+    #[test]
+    fn passthrough_is_the_last_resort() {
+        let p = presets();
+        assert_eq!(p.last().map(|(n, s)| (*n, s.clone())), Some((PASSTHROUGH, passthrough())));
+        // Сайт, который ломают все приёмы, за две неудачи на каждом доходит до «без приёмов».
+        let mut t = Tuner::new(p.len(), 0);
+        for strategy in 0..p.len() - 1 {
+            assert_eq!(t.report("discord.com", strategy, false), None);
+            assert!(t.report("discord.com", strategy, false).is_some());
+        }
+        assert_eq!(t.choice("discord.com"), p.len() - 1);
+        assert!(t.report("discord.com", p.len() - 1, true).is_some());
     }
 
     #[test]

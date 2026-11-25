@@ -8,7 +8,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use vx_engine::vx_core::{QuicMode, Strategy};
-use vx_engine::{Config, Engine, Event, SiteStat, Stats};
+use vx_engine::{Config, Engine, Event, RerouteMode, SiteStat, Stats};
 
 /// Настройки из окна; хранятся в data\settings.json рядом с exe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +31,10 @@ struct Settings {
     tg_cloudflare: bool,
     /// Окно в мини-режиме.
     mini: bool,
+    /// Обход блокировки по IP: off, cloudflare, proxy, warp.
+    ip_block: String,
+    /// SOCKS5-прокси для ip_block = proxy: «host:port» или «socks5://логин:пароль@host:port».
+    ip_proxy: String,
 }
 
 impl Default for Settings {
@@ -45,6 +49,8 @@ impl Default for Settings {
             tg_secret: String::new(),
             tg_cloudflare: true,
             mini: false,
+            ip_block: "off".into(),
+            ip_proxy: String::new(),
         }
     }
 }
@@ -64,7 +70,23 @@ impl Settings {
             auto: self.auto,
             auto_test: false,
             doh: (self.doh != "off").then(|| self.doh.clone()),
+            reroute: self.reroute()?,
         })
+    }
+
+    fn reroute(&self) -> Result<Option<RerouteMode>, String> {
+        Ok(match self.ip_block.as_str() {
+            "off" => None,
+            "cloudflare" => Some(RerouteMode::Cloudflare),
+            "proxy" => Some(RerouteMode::Proxy(vx_engine::Proxy::parse(&self.ip_proxy).map_err(|e| format!("Прокси: {e}"))?)),
+            "warp" => Some(RerouteMode::Warp),
+            other => return Err(format!("Блокировка по IP: неизвестный режим «{other}»")),
+        })
+    }
+
+    /// Нужен ли приёмник соединений (и правило брандмауэра для него).
+    fn needs_relay(&self) -> bool {
+        matches!(self.ip_block.as_str(), "proxy" | "warp")
     }
 }
 
@@ -105,6 +127,8 @@ struct StatsDto {
     send_errors: u64,
     doh_ok: u64,
     doh_fallback: u64,
+    ip_blocked: u64,
+    ip_rerouted: u64,
 }
 
 impl From<Stats> for StatsDto {
@@ -116,6 +140,8 @@ impl From<Stats> for StatsDto {
             send_errors: s.send_errors,
             doh_ok: s.doh_ok,
             doh_fallback: s.doh_fallback,
+            ip_blocked: s.ip_blocked,
+            ip_rerouted: s.ip_rerouted,
         }
     }
 }
@@ -150,6 +176,7 @@ fn log_entry(event: Event) -> LogEntry {
             site: Some(site),
         },
         Event::Warning(text) => LogEntry::new("warning", text),
+        Event::Reroute(text) => LogEntry::new("reroute", text),
     }
 }
 
@@ -279,6 +306,9 @@ fn read_settings(dirs: &Dirs) -> Settings {
 /// Запуск обхода — общий для кнопки, трея и автозапуска. Окну сообщается новое состояние (`vx-status`).
 fn start_engine(app: &AppHandle, state: &AppState, settings: &Settings) -> Result<Status, String> {
     let config = settings.config(&state.dirs)?;
+    if settings.needs_relay() {
+        firewall_allow()?;
+    }
     {
         let mut slot = state.engine.lock().map_err(|e| e.to_string())?;
         if slot.is_none() {
@@ -297,6 +327,8 @@ fn start_engine(app: &AppHandle, state: &AppState, settings: &Settings) -> Resul
 fn stop_engine(app: &AppHandle, state: &AppState) -> Status {
     let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner()).take();
     let last = engine.map(Engine::stop).map(StatsDto::from).unwrap_or_default();
+    // Правило ставится только для режимов с прокси; удаление несуществующего — не ошибка.
+    let _ = firewall_remove();
     let status = Status { running: false, stats: last, doh_server: None, uptime_secs: 0, sites: Vec::new() };
     let _ = app.emit("vx-status", &status);
     status
@@ -369,10 +401,11 @@ fn diagnostics(state: State<AppState>) -> Vec<CheckDto> {
 const AUTOSTART_TASK: &str = "Veyrix-rs";
 const AUTOSTART_ARG: &str = "--autostart";
 
-fn schtasks(args: &[&str]) -> Result<(), String> {
+/// Системная утилита без окна консоли.
+fn run_hidden(exe: &str, args: &[&str]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("schtasks.exe")
+    let out = std::process::Command::new(exe)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -380,9 +413,36 @@ fn schtasks(args: &[&str]) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        // Вывод schtasks — в кодировке консоли; для сообщения хватит кода выхода и текста как есть.
-        Err(format!("schtasks: код {}: {}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).trim()))
+        // Вывод — в кодировке консоли; для сообщения хватит кода выхода и текста как есть.
+        Err(format!("{exe}: код {}: {}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).trim()))
     }
+}
+
+fn schtasks(args: &[&str]) -> Result<(), String> {
+    run_hidden("schtasks.exe", args)
+}
+
+/// Правило брандмауэра Windows для приёмника обхода по IP (режимы «свой прокси» и WARP): соединения к
+/// заблокированным адресам приходят приёмнику как входящие. Ставится при запуске обхода в этих режимах
+/// (пользователь соглашается при выборе режима), снимается при остановке.
+const FIREWALL_RULE: &str = "Veyrix-rs: обход блокировки по IP";
+
+fn firewall_allow() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let _ = firewall_remove();
+    run_hidden(
+        "netsh.exe",
+        &[
+            "advfirewall", "firewall", "add", "rule",
+            &format!("name={FIREWALL_RULE}"), "dir=in", "action=allow", "protocol=TCP", "enable=yes",
+            &format!("program={}", exe.display()),
+        ],
+    )
+    .map_err(|e| format!("Не удалось добавить правило брандмауэра для обхода по IP: {e}"))
+}
+
+fn firewall_remove() -> Result<(), String> {
+    run_hidden("netsh.exe", &["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")])
 }
 
 #[tauri::command(async)]

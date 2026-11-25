@@ -29,6 +29,8 @@ type Settings = {
   tgSecret: string
   tgCloudflare: boolean
   mini: boolean
+  ipBlock: "off" | "cloudflare" | "proxy" | "warp"
+  ipProxy: string
 }
 
 type Stats = {
@@ -38,11 +40,13 @@ type Stats = {
   sendErrors: number
   dohOk: number
   dohFallback: number
+  ipBlocked: number
+  ipRerouted: number
 }
 
 type Status = { running: boolean; stats: Stats; dohServer: string | null; uptimeSecs: number; sites: MapSite[] }
 
-type LogKind = "site" | "works" | "switched" | "warning" | "info" | "error"
+type LogKind = "site" | "works" | "switched" | "warning" | "info" | "error" | "reroute"
 type LogItem = { id: number; time: string; kind: LogKind; text: string }
 
 const LOG_LIMIT = 500
@@ -54,6 +58,7 @@ const KIND_LABEL: Record<LogKind, string> = {
   warning: "внимание",
   info: "движок",
   error: "ошибка",
+  reroute: "обход по IP",
 }
 
 const KIND_VARIANT: Record<LogKind, "default" | "secondary" | "destructive" | "outline"> = {
@@ -63,6 +68,7 @@ const KIND_VARIANT: Record<LogKind, "default" | "secondary" | "destructive" | "o
   warning: "destructive",
   info: "outline",
   error: "destructive",
+  reroute: "secondary",
 }
 
 type Page = "overview" | "log" | "telegram" | "diag" | "dns" | "settings"
@@ -255,6 +261,12 @@ export function App() {
                 <Stat label="QUIC отброшено" value={stats?.dropped} />
                 <Stat label="DNS через DoH" value={stats?.dohOk} hint={stats?.dohFallback ? `обычным путём: ${stats.dohFallback}` : undefined} />
               </div>
+              {(stats?.ipBlocked ?? 0) > 0 && (
+                <p className="text-sm text-muted-foreground">
+                  Блокировка по IP: обходится адресов — {stats?.ipBlocked}, соединений через обход — {stats?.ipRerouted}.
+                  Подробности в журнале.
+                </p>
+              )}
               {(stats?.sendErrors ?? 0) > 0 && (
                 <p className="text-sm text-warning">Не отправлено пакетов: {stats?.sendErrors} — подробности в журнале.</p>
               )}
@@ -360,6 +372,7 @@ export function App() {
                     title="Обход для голоса Discord"
                     hint="Только если провайдер режет голосовые звонки: у части провайдеров это, наоборот, ломает голос."
                   />
+                  <IpBlock settings={settings} update={update} />
                 </div>
               )}
             </Panel>
@@ -401,6 +414,67 @@ function Sidebar({ page, setPage }: { page: Page; setPage: (p: Page) => void }) 
 function Panel({ children, narrow }: { children: ReactNode; narrow?: boolean }) {
   return (
     <section className={`rounded-[22px] border bg-[#121413]/90 p-6 ${narrow ? "max-w-3xl" : ""}`}>{children}</section>
+  )
+}
+
+const IP_BLOCK_HINT: Record<Settings["ipBlock"], string> = {
+  off: "Если до адреса сайта не доходят даже пакеты подключения, программа только сообщит об этом в журнале.",
+  cloudflare:
+    "Только для сайтов за Cloudflare (Discord и многие другие): заблокированный адрес заменяется другим адресом Cloudflare, " +
+    "который отвечает. Работает на этом компьютере, без посредников.",
+  proxy:
+    "Соединения с заблокированными адресами идут через ваш SOCKS5-прокси (любые сайты). Прокси видит, к какому адресу " +
+    "вы подключаетесь; содержимое защищено HTTPS.",
+  warp:
+    "Соединения с заблокированными адресами идут через Cloudflare WARP (любые сайты). WARP нужно установить самим " +
+    "(1.1.1.1 от Cloudflare), включить режим прокси — warp-cli mode proxy — и подключиться: warp-cli connect.",
+}
+
+/// Обход блокировки по IP: режим и адрес своего прокси.
+function IpBlock(props: { settings: Settings; update: (patch: Partial<Settings>) => void }) {
+  const { settings, update } = props
+  const [proxy, setProxy] = useState(settings.ipProxy)
+
+  function choose(mode: string) {
+    const ipBlock = mode as Settings["ipBlock"]
+    if (ipBlock === "proxy" || ipBlock === "warp") {
+      const ok = window.confirm(
+        "Для этого режима Veyrix при запуске обхода добавит правило брандмауэра Windows " +
+          "«Veyrix-rs: обход блокировки по IP» — оно разрешает программе принимать перенаправленные соединения. " +
+          "При остановке обхода правило удаляется.\n\nПродолжить?",
+      )
+      if (!ok) return
+    }
+    update({ ipBlock })
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <Choice
+        title="Если сайт заблокирован по IP-адресу"
+        value={settings.ipBlock}
+        onChange={choose}
+        options={[
+          ["off", "Ничего не делать"],
+          ["cloudflare", "Другой адрес Cloudflare — локально"],
+          ["proxy", "Через свой SOCKS5-прокси"],
+          ["warp", "Через Cloudflare WARP"],
+        ]}
+      />
+      <p className="text-muted-foreground">{IP_BLOCK_HINT[settings.ipBlock]}</p>
+      {settings.ipBlock === "proxy" && (
+        <label className="flex flex-col gap-1">
+          <span className="font-medium">Адрес прокси</span>
+          <input
+            className="rounded-xl border bg-background px-3 py-2"
+            placeholder="127.0.0.1:1080 или socks5://логин:пароль@10.0.0.2:1080"
+            value={proxy}
+            onChange={(e) => setProxy(e.target.value)}
+            onBlur={() => proxy !== settings.ipProxy && update({ ipProxy: proxy.trim() })}
+          />
+        </label>
+      )}
+    </div>
   )
 }
 
