@@ -1,0 +1,9 @@
+[package]
+name = "vx-net"
+description = "Veyrix-rs: HTTPS-запросы через WinHTTP (отчёты о проблемах, обновления)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

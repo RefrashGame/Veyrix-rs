@@ -85,6 +85,10 @@ jobs:
       - name: Build
         shell: pwsh
         working-directory: app
+        env:
+          # Бот «Сообщить о проблеме» (app/src-tauri/src/feedback.rs); без секретов отправка в сборке выключена.
+          VEYRIX_FEEDBACK_TOKEN: ${{ secrets.VEYRIX_FEEDBACK_TOKEN }}
+          VEYRIX_FEEDBACK_CHAT: ${{ secrets.VEYRIX_FEEDBACK_CHAT }}
         run: |
           bun install --frozen-lockfile
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

@@ -3,6 +3,10 @@ import { listen } from "@tauri-apps/api/event"
 import {
   PictureInPicture2,
   Cloud,
+  Download,
+  ImagePlus,
+  MessageSquareWarning,
+  X,
   Power,
   ScrollText,
   Send,
@@ -72,7 +76,7 @@ const KIND_VARIANT: Record<LogKind, "default" | "secondary" | "destructive" | "o
   reroute: "secondary",
 }
 
-type Page = "overview" | "log" | "telegram" | "warp" | "diag" | "dns" | "settings"
+type Page = "overview" | "log" | "telegram" | "warp" | "diag" | "dns" | "settings" | "report"
 
 const PAGES: { id: Page; title: string; icon: ComponentType<{ className?: string }>; group?: string }[] = [
   { id: "overview", title: "Обзор", icon: Waypoints },
@@ -82,6 +86,7 @@ const PAGES: { id: Page; title: string; icon: ComponentType<{ className?: string
   { id: "diag", title: "Диагностика", icon: Stethoscope },
   { id: "dns", title: "DNS Windows", icon: ServerCog, group: "Система" },
   { id: "settings", title: "Настройки", icon: SettingsIcon },
+  { id: "report", title: "Сообщить о проблеме", icon: MessageSquareWarning, group: "Помощь" },
 ]
 
 function now() {
@@ -99,6 +104,15 @@ export function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [status, setStatus] = useState<Status | null>(null)
   const [tg, setTg] = useState<TgStatus | null>(null)
+  const [info, setInfo] = useState<AppInfo | null>(null)
+  const [newVersion, setNewVersion] = useState<UpdateInfo | null>(null)
+
+  // Версия программы и проверка обновлений на GitHub — один раз при запуске (ошибка сети не мешает работе).
+  useEffect(() => {
+    if (!isTauri()) return
+    invoke<AppInfo>("app_info").then(setInfo, () => {})
+    invoke<UpdateInfo | null>("update_check").then(setNewVersion, () => {})
+  }, [])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [log, setLog] = useState<LogItem[]>([])
@@ -250,6 +264,8 @@ export function App() {
           <WindowButtons />
         </header>
 
+        {newVersion && <UpdateBanner update={newVersion} />}
+
         {error && (
           <p className="mb-3 rounded-2xl border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
         )}
@@ -347,6 +363,7 @@ export function App() {
                 <p className="text-sm text-muted-foreground">Загрузка…</p>
               ) : (
                 <div className="flex flex-col gap-5 text-sm">
+                  <UpdateRow info={info} update={newVersion} setUpdate={setNewVersion} />
                   {running && <p className="text-muted-foreground">Изменения применятся после перезапуска обхода.</p>}
                   <Autostart />
                   <Check
@@ -388,6 +405,12 @@ export function App() {
             </Panel>
           )}
           {page === "settings" && <SettingsHelp />}
+
+          {page === "report" && (
+            <Panel narrow>
+              <Report info={info} />
+            </Panel>
+          )}
         </div>
       </div>
     </div>
@@ -427,6 +450,224 @@ function Panel({ children, narrow }: { children: ReactNode; narrow?: boolean }) 
     <section data-tauri-drag-region className={`rounded-[22px] border bg-[#121413]/90 p-6 ${narrow ? "max-w-3xl" : ""}`}>{children}</section>
   )
 }
+
+type AppInfo = { version: string; feedback: boolean }
+type UpdateInfo = {
+  version: string
+  notes: string
+  page: string
+  setupName: string
+  setupUrl: string
+  sumsUrl: string
+  size: number
+}
+
+/// Скачать и запустить установщик новой версии (после подтверждения); Veyrix затем закрывается сам.
+function useInstall(update: UpdateInfo | null) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  async function install() {
+    if (!update) return
+    const mb = (update.size / 1024 / 1024).toFixed(1)
+    const ok = window.confirm(
+      `Скачать Veyrix-rs ${update.version} (${mb} МБ) со страницы релизов GitHub и установить?\n\n` +
+        "Установщик сверяется по SHA256. Обход остановится, Veyrix закроется и откроется мастер установки; " +
+        "настройки сохранятся.",
+    )
+    if (!ok) return
+    setBusy(true)
+    setError(null)
+    try {
+      await invoke("update_install", { update })
+    } catch (e) {
+      setError(String(e))
+      setBusy(false)
+    }
+  }
+  return { busy, error, install }
+}
+
+function UpdateBanner({ update }: { update: UpdateInfo }) {
+  const { busy, error, install } = useInstall(update)
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-3 rounded-2xl border border-primary/40 bg-primary/10 px-4 py-2.5 text-sm">
+      <Download className="size-4 text-primary" />
+      <span className="font-semibold">Доступна версия {update.version}</span>
+      {update.page && (
+        <a href={update.page} target="_blank" rel="noreferrer" className="text-muted-foreground underline">
+          Что нового
+        </a>
+      )}
+      <span className="flex-1" />
+      {error && <span className="text-destructive">{error}</span>}
+      <Button size="sm" disabled={busy} onClick={install}>
+        {busy ? "Скачиваю…" : "Обновить"}
+      </Button>
+    </div>
+  )
+}
+
+function UpdateRow(props: { info: AppInfo | null; update: UpdateInfo | null; setUpdate: (u: UpdateInfo | null) => void }) {
+  const [checking, setChecking] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const { busy, error, install } = useInstall(props.update)
+  async function check() {
+    setChecking(true)
+    setNote(null)
+    try {
+      const u = await invoke<UpdateInfo | null>("update_check")
+      props.setUpdate(u)
+      if (!u) setNote("Установлена последняя версия.")
+    } catch (e) {
+      setNote(String(e))
+    } finally {
+      setChecking(false)
+    }
+  }
+  return (
+    <div className="flex flex-col gap-2 rounded-2xl bg-card px-4 py-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="font-medium">Версия {props.info?.version ?? "…"}</span>
+        <span className="flex-1" />
+        {props.update ? (
+          <Button size="sm" disabled={busy} onClick={install}>
+            {busy ? "Скачиваю…" : `Обновить до ${props.update.version}`}
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" disabled={checking} onClick={check}>
+            {checking ? "Проверяю…" : "Проверить обновления"}
+          </Button>
+        )}
+      </div>
+      {(note || error) && <p className={error ? "text-destructive" : "text-muted-foreground"}>{error ?? note}</p>}
+    </div>
+  )
+}
+
+type Shot = { name: string; data: string }
+
+/// «Сообщить о проблеме»: описание, снимки экрана (файлы или Ctrl+V), Telegram для ответа — разработчику в Telegram.
+function Report({ info }: { info: AppInfo | null }) {
+  const [description, setDescription] = useState("")
+  const [reply, setReply] = useState("")
+  const [shots, setShots] = useState<Shot[]>([])
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
+  const MAX = 6
+
+  function add(files: Iterable<File>) {
+    for (const f of files) {
+      if (!f.type.startsWith("image/")) continue
+      if (f.size > 10 * 1024 * 1024) {
+        setMessage({ ok: false, text: `${f.name}: больше 10 МБ` })
+        continue
+      }
+      const reader = new FileReader()
+      reader.onload = () =>
+        setShots((s) => (s.length >= MAX ? s : [...s, { name: f.name || `снимок-${s.length + 1}.png`, data: String(reader.result) }]))
+      reader.readAsDataURL(f)
+    }
+  }
+
+  async function send() {
+    setBusy(true)
+    setMessage(null)
+    try {
+      await invoke("feedback_send", { description, reply, photos: shots })
+      setMessage({ ok: true, text: "Отправлено. Спасибо! Если оставили Telegram — ответ придёт туда." })
+      setDescription("")
+      setShots([])
+    } catch (e) {
+      setMessage({ ok: false, text: String(e) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (info && !info.feedback) {
+    return <p className="text-sm text-muted-foreground">В этой сборке отправка отчётов не настроена.</p>
+  }
+  return (
+    <div
+      className="flex flex-col gap-4 text-sm"
+      onPaste={(e) => add(Array.from(e.clipboardData.files))}
+    >
+      <p className="text-muted-foreground">
+        Опишите, что случилось, — сообщение придёт разработчику в Telegram. Чем подробнее, тем быстрее получится найти
+        причину.
+      </p>
+      <label className="flex flex-col gap-1">
+        <span className="font-medium">Описание</span>
+        <textarea
+          className="min-h-36 rounded-xl border bg-background px-3 py-2"
+          placeholder="Что делали, что ожидали увидеть и что произошло. Если была ошибка — её текст."
+          maxLength={3000}
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+        />
+      </label>
+      <div className="flex flex-col gap-2">
+        <span className="font-medium">Снимки экрана</span>
+        <div className="flex flex-wrap gap-2">
+          {shots.map((s, i) => (
+            <div key={i} className="relative">
+              <img src={s.data} alt={s.name} className="size-20 rounded-xl border object-cover" />
+              <button
+                type="button"
+                aria-label="Убрать снимок"
+                className="absolute -top-2 -right-2 grid size-6 place-items-center rounded-full bg-destructive text-white"
+                onClick={() => setShots((all) => all.filter((_, j) => j !== i))}
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+          ))}
+          {shots.length < MAX && (
+            <label className="grid size-20 cursor-pointer place-items-center rounded-xl border border-dashed text-muted-foreground hover:border-primary hover:text-primary">
+              <ImagePlus className="size-6" />
+              <input
+                type="file"
+                accept="image/png,image/jpeg"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  add(Array.from(e.target.files ?? []))
+                  e.target.value = ""
+                }}
+              />
+            </label>
+          )}
+        </div>
+        <span className="text-muted-foreground">Можно вставить картинку из буфера обмена: Ctrl+V. Не больше {MAX} снимков.</span>
+      </div>
+      <label className="flex flex-col gap-1">
+        <span className="font-medium">Куда ответить</span>
+        <input
+          className="rounded-xl border bg-background px-3 py-2"
+          placeholder="@ваш_ник в Telegram (необязательно)"
+          maxLength={64}
+          value={reply}
+          onChange={(e) => setReply(e.target.value)}
+        />
+      </label>
+      <div className="flex items-center gap-3">
+        <Button disabled={busy || !description.trim()} onClick={send}>
+          {busy ? "Отправляю…" : "Отправить"}
+        </Button>
+        {message && <span className={message.ok ? "text-primary" : "text-destructive"}>{message.text}</span>}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Отчёт получит только разработчик. Что и куда отправляется —{" "}
+        <a href={PRIVACY_URL} target="_blank" rel="noreferrer" className="underline">
+          политика конфиденциальности
+        </a>
+        .
+      </p>
+    </div>
+  )
+}
+
+const PRIVACY_URL = "https://github.com/RefrashGame/Veyrix-rs/blob/main/PRIVACY.md"
 
 /// Инструкция под настройками: что и когда менять.
 function SettingsHelp() {

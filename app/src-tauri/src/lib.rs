@@ -10,6 +10,9 @@ use tauri_plugin_opener::OpenerExt;
 use vx_engine::vx_core::{QuicMode, Strategy};
 use vx_engine::{Config, Engine, Event, RerouteMode, SiteStat, Stats};
 
+mod feedback;
+mod update;
+
 /// Настройки из окна; хранятся в data\settings.json рядом с exe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -371,6 +374,43 @@ fn warp_check() -> Result<WarpCheck, String> {
     vx_warp::check().map(|(warp, ip)| WarpCheck { warp, ip })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+    version: String,
+    /// В этой сборке настроена отправка отчётов (вшит токен бота).
+    feedback: bool,
+}
+
+#[tauri::command]
+fn app_info(app: AppHandle) -> AppInfo {
+    AppInfo { version: app.package_info().version.to_string(), feedback: feedback::configured() }
+}
+
+#[tauri::command(async)]
+fn feedback_send(app: AppHandle, description: String, reply: String, photos: Vec<feedback::Photo>) -> Result<(), String> {
+    feedback::send(&app.package_info().version.to_string(), &description, &reply, &photos)
+}
+
+#[tauri::command(async)]
+fn update_check(app: AppHandle) -> Result<Option<update::Update>, String> {
+    update::check(&app.package_info().version.to_string())
+}
+
+/// Скачивает и запускает установщик новой версии, затем закрывает Veyrix — установщику нужны свободные файлы.
+#[tauri::command(async)]
+fn update_install(app: AppHandle, state: State<AppState>, update: update::Update) -> Result<(), String> {
+    update::install(&update)?;
+    stop_engine(&app, &state);
+    state.warp.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        handle.exit(0);
+    });
+    Ok(())
+}
+
 /// Запуск обхода — общий для кнопки, трея и автозапуска. Окну сообщается новое состояние (`vx-status`).
 fn start_engine(app: &AppHandle, state: &AppState, settings: &Settings) -> Result<Status, String> {
     let config = settings.config(&state.dirs)?;
@@ -717,6 +757,10 @@ pub fn run() {
             warp_start,
             warp_stop,
             warp_check,
+            app_info,
+            feedback_send,
+            update_check,
+            update_install,
             window_mode,
             window_minimize,
             window_hide

@@ -9,3 +9,5 @@ CLAUDE.md
 /dist/
 # WinDivert для установщика: кладёт release.yml (локально — для проверки)
 /app/src-tauri/engine/
+# Токен бота отчётов для локальной сборки (в git не хранится)
+/.feedback.env
