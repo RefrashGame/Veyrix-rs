@@ -20,6 +20,7 @@ vx-engine = { path = "../../crates/engine" }
 vx-sysdns = { path = "../../crates/sysdns" }
 vx-diag = { path = "../../crates/diag" }
 vx-tg = { path = "../../crates/tg" }
+vx-warp = { path = "../../crates/warp" }
 log = "0.4"
 tauri-plugin-log = "2.10"
 tauri = { version = "2.12", features = ["tray-icon"] }

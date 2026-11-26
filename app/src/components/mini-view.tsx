@@ -34,7 +34,7 @@ export function MiniView(props: Props) {
   ]
 
   return (
-    <div className="flex h-svh flex-col gap-3 p-3.5">
+    <div data-tauri-drag-region className="flex h-svh flex-col gap-3 p-3.5">
       <div data-tauri-drag-region className="flex items-center gap-2.5">
         <img src={logo} alt="" className="size-8 rounded-[10px]" />
         <b data-tauri-drag-region className="flex-1 text-base font-extrabold tracking-tight">
@@ -44,7 +44,7 @@ export function MiniView(props: Props) {
         <WindowButtons />
       </div>
 
-      <section className="map-field flex flex-col items-center gap-2.5 rounded-[20px] border px-4 pt-5 pb-4">
+      <section data-tauri-drag-region className="map-field flex flex-col items-center gap-2.5 rounded-[20px] border px-4 pt-5 pb-4">
         <button
           type="button"
           title={running ? "Остановить обход" : "Запустить обход"}
@@ -79,7 +79,7 @@ export function MiniView(props: Props) {
         {props.error && <p className="text-center text-xs text-destructive">{props.error}</p>}
       </section>
 
-      <ul className="rounded-[18px] border bg-[#121413]/90 p-1.5">
+      <ul data-tauri-drag-region className="rounded-[18px] border bg-[#121413]/90 p-1.5">
         {SERVICES.map((svc) => {
           const s = summary[svc.id]
           const viaProxy = svc.id === "telegram" && tgOn
@@ -122,7 +122,7 @@ export function MiniView(props: Props) {
         })}
       </ul>
 
-      <div className="grid grid-cols-3 gap-2">
+      <div data-tauri-drag-region className="grid grid-cols-3 gap-2">
         <MiniStat label="С приёмом" value={stats?.changed} />
         <MiniStat label="QUIC отброшено" value={stats?.dropped} />
         <MiniStat label="DNS через DoH" value={stats?.dohOk} />

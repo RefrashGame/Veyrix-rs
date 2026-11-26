@@ -51,7 +51,11 @@ Microsoft Defender может удалить официальный архив W
 Крейт `vx-reroute`, режим — «Настройки» → «Если сайт заблокирован по IP-адресу» (`ipBlock`: off, cloudflare,
 proxy, warp; адрес прокси — `ipProxy`). События — в «Журнале» с меткой «обход по IP». Для proxy и warp при
 запуске обхода ставится правило брандмауэра «Veyrix-rs: обход блокировки по IP», при остановке удаляется.
-WARP: установить Cloudflare WARP, затем `warp-cli mode proxy` и `warp-cli connect` (прокси на 127.0.0.1:40000).
+WARP встроен (крейт `vx-warp`, вкладка «WARP»): `engine\warp\wgcf.exe` регистрирует аккаунт и пишет профиль
+WireGuard в `data\warp\`, `engine\warp\wireproxy.exe` по нему даёт SOCKS5 на 127.0.0.1:40100; Veyrix запускает его
+перед обходом в режиме WARP и останавливает при выходе. Программы в git не хранятся: `toolsetch-warp.ps1 -Dest
+app\src-tauri\engine\warp` скачивает их с официальных релизов и сверяет SHA256 (так же делает `release.yml`);
+для запуска из `targetelease` скопируйте папку в `targetelease\engine\warp`.
 Проверка без настоящей блокировки: отдельным перехватом WinDivert (приоритет ниже 200) выбрасывать исходящие
 SYN к выбранному адресу — через ~3 с соединения пойдут в обход. Прокси для проверки должен ходить к адресу
 не с этого компьютера (иначе петля), а VPN с fake-ip (dropweb) искажает результат — проверять без него.
@@ -76,4 +80,15 @@ SYN к выбранному адресу — через ~3 с соединени
 ## Релиз
 
 Тег `vX.Y.Z` (версии в `Cargo.toml`, `app/package.json`, `app/src-tauri/tauri.conf.json` совпадают с тегом,
-описание — `docs/releases/vX.Y.Z.md`) → `release.yml` собирает пакет и черновик релиза; публикация — вручную.
+описание — `docs/releases/vX.Y.Z.md`) → `release.yml` собирает установщик NSIS, архив zip и черновик релиза;
+публикация — вручную. Установщик локально (WinDivert и `WinDivert-LICENSE.txt` — в `app\src-tauri\engine\`;
+отдельная папка сборки, если запущенный Veyrix держит файлы в `target\release`):
+
+```powershell
+cd app
+$env:CARGO_TARGET_DIR = "..\target\nsis"; bun run tauri build --config src-tauri/tauri.nsis.conf.json
+# → target\nsis\release\bundle\nsis\Veyrix-rs_<версия>_x64-setup.exe
+```
+
+Установщик (`tauri.nsis.conf.json`): для текущего пользователя (без прав администратора, `%LOCALAPPDATA%\Veyrix-rs`),
+русский, LZMA. При первой сборке Tauri сам скачивает NSIS со своей страницы релизов и сверяет хеш.

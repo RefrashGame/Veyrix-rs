@@ -1,6 +1,6 @@
 name: Release
 
-# Тег vX.Y.Z → проверки, сборка окна, пакет zip с WinDivert и черновик релиза.
+# Тег vX.Y.Z → проверки, сборка окна, установщик и пакет zip с WinDivert и черновик релиза.
 # Для уже созданного тега — запуск вручную (Actions → Release → Run workflow, tag = vX.Y.Z): код берётся из тега,
 # этот файл — из выбранной ветки.
 # Опубликовать черновик — кнопкой Publish на GitHub (или `gh release edit vX.Y.Z --draft=false`).
@@ -54,16 +54,6 @@ jobs:
         with:
           bun-version: 1.4.5
 
-      - name: Build
-        shell: pwsh
-        working-directory: app
-        run: |
-          bun install --frozen-lockfile
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          bun run lint
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          bun run tauri build --no-bundle
-
       - name: WinDivert
         shell: pwsh
         run: |
@@ -83,6 +73,25 @@ jobs:
           if ($sig.Status -ne 'Valid') { throw "WinDivert64.sys: подпись недействительна ($($sig.Status))" }
           if (-not (Test-Path "$root/LICENSE")) { throw "В архиве WinDivert нет LICENSE" }
           "WINDIVERT_DIR=$root" >> $env:GITHUB_ENV
+          # Установщик берёт WinDivert и его лицензию отсюда (tauri.nsis.conf.json).
+          New-Item -ItemType Directory -Force app/src-tauri/engine | Out-Null
+          Copy-Item $dll, $sys app/src-tauri/engine
+          Copy-Item "$root/LICENSE" app/src-tauri/engine/WinDivert-LICENSE.txt
+
+      - name: WARP (wgcf, wireproxy)
+        shell: pwsh
+        run: ./tools/fetch-warp.ps1 -Dest app/src-tauri/engine/warp
+
+      - name: Build
+        shell: pwsh
+        working-directory: app
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          bun run lint
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # Установщик NSIS; target/release/veyrix.exe из этой же сборки идёт в архив.
+          bun run tauri build --config src-tauri/tauri.nsis.conf.json
 
       - name: Package
         shell: pwsh
@@ -95,9 +104,13 @@ jobs:
           Copy-Item "$env:WINDIVERT_DIR/x64/WinDivert.dll", "$env:WINDIVERT_DIR/x64/WinDivert64.sys" "$dir/engine"
           Copy-Item README.md, LICENSE, THIRD-PARTY-LICENSES.md $dir
           Copy-Item "$env:WINDIVERT_DIR/LICENSE" "$dir/licenses/WinDivert-LICENSE.txt"
+          New-Item -ItemType Directory -Force "$dir/engine/warp" | Out-Null
+          Copy-Item app/src-tauri/engine/warp/wgcf.exe, app/src-tauri/engine/warp/wireproxy.exe "$dir/engine/warp"
+          Copy-Item app/src-tauri/engine/warp/*-LICENSE.txt "$dir/licenses"
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Copy-Item "target/release/bundle/nsis/Veyrix-rs_${version}_x64-setup.exe" "dist/$name-setup.exe"
+          $sums = Get-ChildItem dist -File | ForEach-Object { "$((Get-FileHash $_.FullName).Hash.ToLower())  $($_.Name)" }
+          $sums | Set-Content -Encoding ascii dist/SHA256SUMS.txt
           Get-Content dist/SHA256SUMS.txt
 
       - name: Draft release
@@ -107,7 +120,7 @@ jobs:
         run: |
           $version = $env:TAG.TrimStart('v')
           # Версия с суффиксом (0.2.0-beta) — предварительный выпуск: не становится «последним».
-          $ghArgs = @('release', 'create', $env:TAG, "dist/Veyrix-rs-$version-x64.zip", 'dist/SHA256SUMS.txt',
+          $ghArgs = @('release', 'create', $env:TAG, "dist/Veyrix-rs-$version-x64-setup.exe", "dist/Veyrix-rs-$version-x64.zip", 'dist/SHA256SUMS.txt',
             '--draft', '--verify-tag', '--title', "Veyrix-rs $version", '--notes-file', "docs/releases/$env:TAG.md")
           if ($version.Contains('-')) { $ghArgs += '--prerelease' }
           & gh @ghArgs

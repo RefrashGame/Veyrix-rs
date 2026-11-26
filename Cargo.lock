@@ -4246,7 +4246,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veyrix"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 dependencies = [
  "log",
  "serde",
@@ -4260,6 +4260,7 @@ dependencies = [
  "vx-engine",
  "vx-sysdns",
  "vx-tg",
+ "vx-warp",
 ]
 
 [[package]]
@@ -4284,11 +4285,11 @@ dependencies = [
 
 [[package]]
 name = "vx-core"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 
 [[package]]
 name = "vx-diag"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 dependencies = [
  "vx-core",
  "vx-doh",
@@ -4297,15 +4298,15 @@ dependencies = [
 
 [[package]]
 name = "vx-divert"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 
 [[package]]
 name = "vx-doh"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 
 [[package]]
 name = "vx-engine"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 dependencies = [
  "vx-core",
  "vx-divert",
@@ -4315,18 +4316,25 @@ dependencies = [
 
 [[package]]
 name = "vx-reroute"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 dependencies = [
  "vx-divert",
 ]
 
 [[package]]
 name = "vx-sysdns"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 
 [[package]]
 name = "vx-tg"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
+
+[[package]]
+name = "vx-warp"
+version = "0.2.1-beta"
+dependencies = [
+ "vx-reroute",
+]
 
 [[package]]
 name = "walkdir"

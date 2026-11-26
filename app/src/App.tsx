@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ComponentType, type Reac
 import { listen } from "@tauri-apps/api/event"
 import {
   PictureInPicture2,
+  Cloud,
   Power,
   ScrollText,
   Send,
@@ -71,12 +72,13 @@ const KIND_VARIANT: Record<LogKind, "default" | "secondary" | "destructive" | "o
   reroute: "secondary",
 }
 
-type Page = "overview" | "log" | "telegram" | "diag" | "dns" | "settings"
+type Page = "overview" | "log" | "telegram" | "warp" | "diag" | "dns" | "settings"
 
 const PAGES: { id: Page; title: string; icon: ComponentType<{ className?: string }>; group?: string }[] = [
   { id: "overview", title: "Обзор", icon: Waypoints },
   { id: "log", title: "Журнал", icon: ScrollText },
   { id: "telegram", title: "Telegram", icon: Send },
+  { id: "warp", title: "WARP", icon: Cloud },
   { id: "diag", title: "Диагностика", icon: Stethoscope },
   { id: "dns", title: "DNS Windows", icon: ServerCog, group: "Система" },
   { id: "settings", title: "Настройки", icon: SettingsIcon },
@@ -218,10 +220,10 @@ export function App() {
   }
 
   return (
-    <div className="flex h-svh">
+    <div data-tauri-drag-region className="flex h-svh">
       <Sidebar page={page} setPage={setPage} />
 
-      <div className="flex min-w-0 flex-1 flex-col py-5 pr-7 pl-2">
+      <div data-tauri-drag-region className="flex min-w-0 flex-1 flex-col py-5 pr-7 pl-2">
         {/* Шапка — она же заголовок окна: за пустое место окно перетаскивается. */}
         <header data-tauri-drag-region className="mb-4 flex items-center gap-3">
           <h1 data-tauri-drag-region className="text-[21px] font-extrabold tracking-tight">
@@ -252,9 +254,9 @@ export function App() {
           <p className="mb-3 rounded-2xl border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
         )}
 
-        <div data-ui-scroll-container className="flex min-h-0 flex-1 flex-col">
+        <div data-ui-scroll-container data-tauri-drag-region className="flex min-h-0 flex-1 flex-col">
           {page === "overview" && (
-            <div className="flex min-h-full flex-col gap-3">
+            <div data-tauri-drag-region className="flex min-h-full flex-col gap-3">
               <div className="grid grid-cols-4 gap-3">
                 <Stat label="Соединений с приёмом" value={stats?.changed} />
                 <Stat label="Пропущено без изменений" value={stats?.passed} />
@@ -278,6 +280,8 @@ export function App() {
                   quic={settings.quic}
                   doh={settings.doh}
                   dohServer={status?.dohServer ?? null}
+                  ipBlock={settings.ipBlock}
+                  ipProxy={settings.ipProxy}
                   stats={stats}
                   sites={status?.sites ?? []}
                   verdicts={verdicts}
@@ -316,6 +320,12 @@ export function App() {
           {page === "telegram" && settings && (
             <Panel narrow>
               <Telegram settings={settings} update={update} status={tg} setStatus={setTg} />
+            </Panel>
+          )}
+
+          {page === "warp" && settings && (
+            <Panel narrow>
+              <Warp settings={settings} update={update} />
             </Panel>
           )}
 
@@ -377,6 +387,7 @@ export function App() {
               )}
             </Panel>
           )}
+          {page === "settings" && <SettingsHelp />}
         </div>
       </div>
     </div>
@@ -385,9 +396,9 @@ export function App() {
 
 function Sidebar({ page, setPage }: { page: Page; setPage: (p: Page) => void }) {
   return (
-    <aside className="m-3 flex w-[230px] shrink-0 flex-col gap-1 rounded-[22px] border border-sidebar-border bg-sidebar px-3 py-4">
+    <aside data-tauri-drag-region className="m-3 flex w-[230px] shrink-0 flex-col gap-1 rounded-[22px] border border-sidebar-border bg-sidebar px-3 py-4">
       <div data-tauri-drag-region className="flex items-center gap-3 px-2 pb-6">
-        <img src={logo} alt="" className="size-9 rounded-xl" />
+        <img src={logo} alt="" className="size-12" />
         <b className="text-xl font-extrabold tracking-tight">Veyrix</b>
       </div>
       {PAGES.map((p) => (
@@ -413,7 +424,200 @@ function Sidebar({ page, setPage }: { page: Page; setPage: (p: Page) => void }) 
 
 function Panel({ children, narrow }: { children: ReactNode; narrow?: boolean }) {
   return (
-    <section className={`rounded-[22px] border bg-[#121413]/90 p-6 ${narrow ? "max-w-3xl" : ""}`}>{children}</section>
+    <section data-tauri-drag-region className={`rounded-[22px] border bg-[#121413]/90 p-6 ${narrow ? "max-w-3xl" : ""}`}>{children}</section>
+  )
+}
+
+/// Инструкция под настройками: что и когда менять.
+function SettingsHelp() {
+  const items: [string, string][] = [
+    [
+      "С чего начать",
+      "Нажмите «Запустить обход» — настроек по умолчанию (автоподбор включён, QUIC — фейк) обычно хватает. " +
+        "Перед этим закройте другие обходчики и VPN (zapret, GoodbyeDPI и т. п.): две такие программы мешают друг другу. " +
+        "Вкладка «Диагностика» покажет, если что-то мешает.",
+    ],
+    [
+      "Изменили настройку",
+      "Остановите и снова запустите обход — настройки применяются при запуске.",
+    ],
+    [
+      "YouTube открывается, а видео не идёт или тормозит",
+      "QUIC (HTTP/3) → «Выключить QUIC»: браузер перейдёт на обычный HTTPS, где работает обход.",
+    ],
+    [
+      "Сайт не открывается совсем",
+      "Оставьте автоподбор включённым и обновите страницу несколько раз: программа сама пробует другие приёмы " +
+        "(в «Журнале» — «не открывается с … → пробую …»). Если провайдер подменяет адреса сайтов, поставьте " +
+        "DNS → «DNS-over-HTTPS: Cloudflare» (если Cloudflare недоступен — Google или Quad9).",
+    ],
+    [
+      "В журнале «не отвечает (блокировка по IP)»",
+      "До адреса не доходят даже пакеты подключения — приёмы не помогут. «Если сайт заблокирован по IP-адресу»: " +
+        "для Discord и других сайтов за Cloudflare — «Другой адрес Cloudflare»; для любых сайтов — свой SOCKS5-прокси " +
+        "(адрес вида 127.0.0.1:1080) или WARP (один раз зарегистрировать во вкладке «WARP»).",
+    ],
+    [
+      "WARP",
+      "Вкладка «WARP»: «Зарегистрировать» (один раз, бесплатный аккаунт Cloudflare WARP), затем «Проверить» — " +
+        "должно быть «WARP работает». Дальше Veyrix сам включает WARP вместе с обходом, если в настройках выбрано " +
+        "«Через WARP». Через WARP идут только соединения с адресами, заблокированными по IP.",
+    ],
+    [
+      "Голос Discord",
+      "Включайте «Обход для голоса Discord», только если голос не подключается из-за провайдера. " +
+        "Если с ним появилось «Нет маршрута» — выключите.",
+    ],
+    [
+      "Telegram",
+      "Вкладка «Telegram»: «Запустить прокси», затем «Подключить Telegram» — Telegram Desktop сам предложит прокси.",
+    ],
+    [
+      "Запуск вместе с Windows",
+      "Переключатель вверху настроек: Veyrix запустится в трее и сразу включит обход. Крестик окна тоже прячет его " +
+        "в трей; выйти — правой кнопкой по значку у часов.",
+    ],
+  ]
+  return (
+    <section data-tauri-drag-region className="mt-3 max-w-3xl rounded-[22px] border bg-[#121413]/90 p-6 text-sm">
+      <h2 className="mb-3 text-base font-bold">Как настроить</h2>
+      <dl className="flex flex-col gap-3">
+        {items.map(([title, text]) => (
+          <div key={title}>
+            <dt className="font-medium">{title}</dt>
+            <dd className="text-muted-foreground">{text}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  )
+}
+
+const FIREWALL_CONFIRM =
+  "Для этого режима Veyrix при запуске обхода добавит правило брандмауэра Windows " +
+  "«Veyrix-rs: обход блокировки по IP» — оно разрешает программе принимать перенаправленные соединения. " +
+  "При остановке обхода правило удаляется.\n\nПродолжить?"
+
+type WarpStatus = { installed: boolean; registered: boolean; running: boolean; port: number }
+
+/// Встроенный WARP: регистрация (с согласием на условия Cloudflare), запуск, проверка.
+function Warp(props: { settings: Settings; update: (patch: Partial<Settings>) => void }) {
+  const [status, setStatus] = useState<WarpStatus | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
+
+  useEffect(() => {
+    const poll = () => invoke<WarpStatus>("warp_status").then(setStatus, () => {})
+    poll()
+    const timer = setInterval(poll, 3000)
+    return () => clearInterval(timer)
+  }, [])
+
+  async function run(command: string, what: string, done?: string) {
+    setBusy(what)
+    setMessage(null)
+    try {
+      setStatus(await invoke<WarpStatus>(command))
+      if (done) setMessage({ ok: true, text: done })
+    } catch (e) {
+      setMessage({ ok: false, text: String(e) })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  function register() {
+    const ok = window.confirm(
+      "Veyrix зарегистрирует бесплатный аккаунт Cloudflare WARP (программа wgcf) и примет от вашего имени условия " +
+        "использования WARP: https://www.cloudflare.com/application/terms/\n\n" +
+        "Ключи аккаунта сохранятся на этом компьютере в папке data\\warp. Продолжить?",
+    )
+    if (ok) run("warp_register", "Регистрирую…", "WARP зарегистрирован. Нажмите «Включить» и «Проверить».")
+  }
+
+  async function check() {
+    setBusy("Проверяю…")
+    setMessage(null)
+    try {
+      const r = await invoke<{ warp: string; ip: string }>("warp_check")
+      setMessage(
+        r.warp === "off"
+          ? { ok: false, text: `Ответ пришёл, но не через WARP (адрес ${r.ip}).` }
+          : { ok: true, text: r.ip ? `WARP работает: адрес выхода ${r.ip}.` : "WARP работает: туннель отвечает." },
+      )
+    } catch (e) {
+      setMessage({ ok: false, text: String(e) })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const s = status
+  const used = props.settings.ipBlock === "warp"
+  return (
+    <div className="flex flex-col gap-4 text-sm">
+      <p className="text-muted-foreground">
+        WARP от Cloudflare встроен в Veyrix: отдельно ставить ничего не нужно. Через него идут только соединения с
+        адресами, заблокированными по IP, — остальной трафик идёт как обычно. Внутри — открытые программы wgcf
+        (регистрация) и wireproxy (WireGuard без драйвера, SOCKS5 на 127.0.0.1:{s?.port ?? 40100}).
+      </p>
+      {s && !s.installed && (
+        <p className="text-destructive">Программы WARP не найдены в папке engine\warp — переустановите Veyrix.</p>
+      )}
+      <ul className="flex flex-col gap-2">
+        <Row label="Аккаунт" value={s?.registered ? "зарегистрирован" : "не зарегистрирован"} ok={s?.registered} />
+        <Row label="WARP" value={s?.running ? `работает · 127.0.0.1:${s.port}` : "выключен"} ok={s?.running} />
+        <Row
+          label="Используется для блокировок по IP"
+          value={used ? "да" : "нет — выберите «Через WARP» ниже"}
+          ok={used}
+        />
+      </ul>
+      <div className="flex flex-wrap gap-2">
+        {!s?.registered ? (
+          <Button disabled={!!busy || !s?.installed} onClick={register}>
+            Зарегистрировать
+          </Button>
+        ) : s.running ? (
+          <Button variant="secondary" disabled={!!busy} onClick={() => run("warp_stop", "Выключаю…")}>
+            Выключить
+          </Button>
+        ) : (
+          <Button disabled={!!busy} onClick={() => run("warp_start", "Включаю…")}>
+            Включить
+          </Button>
+        )}
+        <Button variant="outline" disabled={!!busy || !s?.running} onClick={check}>
+          Проверить
+        </Button>
+        {!used && (
+          <Button
+            variant="outline"
+            disabled={!!busy || !s?.registered}
+            onClick={() => window.confirm(FIREWALL_CONFIRM) && props.update({ ipBlock: "warp" })}
+          >
+            Использовать для блокировок по IP
+          </Button>
+        )}
+      </div>
+      {busy && <p className="text-muted-foreground">{busy}</p>}
+      {message && <p className={message.ok ? "text-primary" : "text-destructive"}>{message.text}</p>}
+      <p className="text-muted-foreground">
+        Если регистрация не проходит: выключите VPN, нажмите вверху «Запустить обход» (сервер регистрации WARP может
+        блокироваться провайдером) и зарегистрируйте ещё раз. Если «Проверить» не проходит: провайдер может блокировать сам WARP (протокол WireGuard) — тогда выберите для
+        блокировок по IP свой SOCKS5-прокси или «Другой адрес Cloudflare». Выбор «Через WARP» добавляет при запуске
+        обхода правило брандмауэра «Veyrix-rs: обход блокировки по IP».
+      </p>
+    </div>
+  )
+}
+
+function Row(props: { label: string; value: string; ok?: boolean }) {
+  return (
+    <li className="flex justify-between gap-4 rounded-2xl bg-card px-4 py-3">
+      <span className="font-medium">{props.label}</span>
+      <span className={props.ok ? "text-primary" : "text-muted-foreground"}>{props.value}</span>
+    </li>
   )
 }
 
@@ -426,8 +630,8 @@ const IP_BLOCK_HINT: Record<Settings["ipBlock"], string> = {
     "Соединения с заблокированными адресами идут через ваш SOCKS5-прокси (любые сайты). Прокси видит, к какому адресу " +
     "вы подключаетесь; содержимое защищено HTTPS.",
   warp:
-    "Соединения с заблокированными адресами идут через Cloudflare WARP (любые сайты). WARP нужно установить самим " +
-    "(1.1.1.1 от Cloudflare), включить режим прокси — warp-cli mode proxy — и подключиться: warp-cli connect.",
+    "Соединения с заблокированными адресами идут через WARP, встроенный в Veyrix (любые сайты). Его нужно один раз " +
+    "зарегистрировать во вкладке «WARP»; включается он сам вместе с обходом.",
 }
 
 /// Обход блокировки по IP: режим и адрес своего прокси.
@@ -438,12 +642,7 @@ function IpBlock(props: { settings: Settings; update: (patch: Partial<Settings>)
   function choose(mode: string) {
     const ipBlock = mode as Settings["ipBlock"]
     if (ipBlock === "proxy" || ipBlock === "warp") {
-      const ok = window.confirm(
-        "Для этого режима Veyrix при запуске обхода добавит правило брандмауэра Windows " +
-          "«Veyrix-rs: обход блокировки по IP» — оно разрешает программе принимать перенаправленные соединения. " +
-          "При остановке обхода правило удаляется.\n\nПродолжить?",
-      )
-      if (!ok) return
+      if (!window.confirm(FIREWALL_CONFIRM)) return
     }
     update({ ipBlock })
   }
@@ -458,7 +657,7 @@ function IpBlock(props: { settings: Settings; update: (patch: Partial<Settings>)
           ["off", "Ничего не делать"],
           ["cloudflare", "Другой адрес Cloudflare — локально"],
           ["proxy", "Через свой SOCKS5-прокси"],
-          ["warp", "Через Cloudflare WARP"],
+          ["warp", "Через WARP (встроенный)"],
         ]}
       />
       <p className="text-muted-foreground">{IP_BLOCK_HINT[settings.ipBlock]}</p>

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "engine/WinDivert.dll": "engine/WinDivert.dll",
+      "engine/WinDivert64.sys": "engine/WinDivert64.sys",
+      "engine/WinDivert-LICENSE.txt": "licenses/WinDivert-LICENSE.txt",
+      "engine/warp/wgcf.exe": "engine/warp/wgcf.exe",
+      "engine/warp/wireproxy.exe": "engine/warp/wireproxy.exe",
+      "engine/warp/wgcf-LICENSE.txt": "licenses/wgcf-LICENSE.txt",
+      "engine/warp/wireproxy-LICENSE.txt": "licenses/wireproxy-LICENSE.txt",
+      "../../LICENSE": "LICENSE.txt",
+      "../../THIRD-PARTY-LICENSES.md": "THIRD-PARTY-LICENSES.md"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "languages": ["Russian"],
+        "displayLanguageSelector": false,
+        "compression": "lzma"
+      }
+    }
+  }
+}

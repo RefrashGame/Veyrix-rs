@@ -4,7 +4,7 @@
 //! - **Cloudflare** — локально, без посредников: адрес Cloudflare заменяется другим адресом Cloudflare, который
 //!   отвечает (сайт выбирается по имени в TLS). Подменяются адреса в пакетах; программа этого не замечает.
 //! - **Свой прокси** — соединение уходит через SOCKS5-прокси пользователя.
-//! - **WARP** — то же через Cloudflare WARP в режиме прокси (127.0.0.1:40000); WARP ставит сам пользователь.
+//! - **WARP** — то же через встроенный WARP (крейт `vx-warp`: wireproxy на 127.0.0.1:40100).
 //!
 //! Для прокси соединение перехватывается и разворачивается на локальный приёмник (как streamdump в примерах
 //! WinDivert): пакеты к заблокированному адресу приходят приёмнику как входящие, ответы — обратно программе.
@@ -30,8 +30,8 @@ use nat::{Nat, Tcp4};
 use ranges::{SEEDS, is_cloudflare, is_public};
 pub use socks::Proxy;
 
-/// Адрес Cloudflare WARP в режиме прокси (`warp-cli mode proxy`).
-pub const WARP_PROXY: &str = "127.0.0.1:40000";
+/// SOCKS5 встроенного WARP (wireproxy, крейт `vx-warp`; тот же порт — `vx_warp::PORT`).
+pub const WARP_PROXY: &str = "127.0.0.1:40100";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -150,10 +150,7 @@ impl Reroute {
         let proxy = mode.proxy();
         if let Some(p) = &proxy {
             TcpStream::connect_timeout(&p.addr, Duration::from_secs(2)).map_err(|e| match mode {
-                Mode::Warp => format!(
-                    "Cloudflare WARP не отвечает на {WARP_PROXY} ({e}). Установите WARP, включите режим прокси \
-                     (warp-cli mode proxy) и подключитесь (warp-cli connect)."
-                ),
+                Mode::Warp => format!("WARP не отвечает на {WARP_PROXY} ({e}). Проверьте его во вкладке «WARP»."),
                 _ => format!("Прокси {} не отвечает: {e}", p.addr),
             })?;
         }

@@ -3,23 +3,31 @@ import {
   Ban,
   CircleCheck,
   CircleDashed,
+  Cloud,
   Globe,
   Laptop,
   LockKeyhole,
   Monitor,
+  Network,
   RefreshCw,
+  Route,
   Scissors,
   Send,
+  Server,
+  ShieldAlert,
   ShieldCheck,
+  Waypoints,
 } from "lucide-react"
 
 import { SERVICES, serviceOf, type ServiceId } from "@/lib/services"
 
-// Карта «Обзора»: компьютер → модули защиты → сервисы. Линии и бегущие точки — только по живым данным:
-// точки бегут, если за последние секунды по этому пути прошли новые соединения, DNS-запросы или байты прокси.
+// Карта «Обзора»: компьютер → путь (Veyrix, WARP, SOCKS5) → как перенаправляется (модули) → сервисы.
+// Линии и бегущие точки — только по живым данным: точки бегут, если за последние секунды по этому пути
+// прошли новые соединения, DNS-запросы или байты прокси.
 
 export type MapSite = { site: string; connections: number; dns: number; idleMs: number; strategy: string | null }
 export type Verdict = "works" | "switched"
+export type IpBlockMode = "off" | "cloudflare" | "proxy" | "warp"
 
 type Props = {
   /// Секундный счётчик окна: отсчитывает, давно ли рос трафик.
@@ -29,7 +37,9 @@ type Props = {
   quic: "fake" | "drop" | "pass"
   doh: string
   dohServer: string | null
-  stats?: { changed: number; passed: number; dropped: number; dohOk: number }
+  ipBlock: IpBlockMode
+  ipProxy: string
+  stats?: { changed: number; passed: number; dropped: number; dohOk: number; ipBlocked: number; ipRerouted: number }
   sites: MapSite[]
   verdicts: Record<string, Verdict>
   tg: { running: boolean; port: number; active: number; up: number; down: number } | null
@@ -40,22 +50,30 @@ const ACTIVE_TICKS = 5
 
 const GREEN = "#39f07a"
 const AMBER = "#f5b13d"
+const ORANGE = "#ff8a3d"
+const VIOLET = "#c58bff"
 
-type ModuleId = "dpi" | "quic" | "doh" | "tgp"
+type RouteId = "veyrix" | "warp" | "socks"
+type ModuleId = "dpi" | "quic" | "doh" | "ipswap" | "tgp"
 type Status = "ok" | "warn" | "off"
+type Icon = ComponentType<{ className?: string }>
+type Point = [number, number]
 
 // Координаты сцены; сцена масштабируется под размер окна.
 const STAGE = { w: 1000, h: 560 }
 const COLS = [
-  { x: 20, w: 210, title: "Компьютер", icon: Monitor },
-  { x: 380, w: 240, title: "Защита", icon: ShieldCheck },
-  { x: 740, w: 240, title: "Сервисы", icon: Globe },
+  { x: 0, w: 170, title: "Компьютер", icon: Monitor },
+  { x: 215, w: 175, title: "Путь", icon: Route },
+  { x: 440, w: 215, title: "Как перенаправляется", icon: ShieldCheck },
+  { x: 770, w: 230, title: "Сервисы", icon: Globe },
 ]
 const PC_Y = 280
-const MODULE_Y: Record<ModuleId, number> = { dpi: 110, quic: 220, doh: 330, tgp: 440 }
-const SERVICE_Y: Record<ServiceId, number> = { youtube: 70, google: 175, discord: 280, other: 385, telegram: 490 }
+const ROUTE_Y: Record<RouteId, number> = { veyrix: 150, warp: 300, socks: 420 }
+const MODULE_Y: Record<ModuleId, number> = { dpi: 60, quic: 160, doh: 260, ipswap: 360, tgp: 470 }
+const SERVICE_Y: Record<ServiceId, number> = { youtube: 45, google: 133, discord: 221, telegram: 309, other: 397 }
+const BLOCKED_Y = 500
 
-type Edge = { key: string; from: [number, number]; to: [number, number]; color: string; weight: 0 | 1 | 2 | 3 }
+type Edge = { key: string; from: Point; to: Point; color: string; weight: 0 | 1 | 2 | 3 }
 
 function plural(n: number, one: string, few: string, many: string) {
   const m10 = n % 10
@@ -66,7 +84,7 @@ function plural(n: number, one: string, few: string, many: string) {
 }
 
 export function ServiceMap(props: Props) {
-  const { tick, running, stats, sites, verdicts, tg } = props
+  const { tick, running, stats, sites, verdicts, tg, ipBlock } = props
 
   // Сколько секунд (тиков) назад вырос каждый счётчик: по этому решается, бегут ли точки.
   const counters: Record<string, number> = {
@@ -74,6 +92,7 @@ export function ServiceMap(props: Props) {
     quic: stats?.dropped ?? 0,
     doh: stats?.dohOk ?? 0,
     tgp: (tg?.up ?? 0) + (tg?.down ?? 0),
+    ip: stats?.ipRerouted ?? 0,
   }
   const [track, setTrack] = useState({ tick, counters, age: {} as Record<string, number> })
   if (track.tick !== tick) {
@@ -84,6 +103,7 @@ export function ServiceMap(props: Props) {
     setTrack({ tick, counters, age })
   }
   const pulsing = (key: string) => (track.age[key] ?? ACTIVE_TICKS) < ACTIVE_TICKS
+  const w = (on: boolean): Edge["weight"] => (on ? 3 : 1)
 
   // Сайты по сервисам.
   const groups = new Map<ServiceId, MapSite[]>()
@@ -93,10 +113,39 @@ export function ServiceMap(props: Props) {
   }
 
   const tgOn = tg?.running ?? false
+  const veyrixOn = running || tgOn
   const quicOn = running && props.quic !== "pass"
   const dohOn = running && props.doh !== "off"
+  const ipOn = running && ipBlock !== "off"
+  const ipBlocked = stats?.ipBlocked ?? 0
+  const ipRerouted = stats?.ipRerouted ?? 0
+  const ipLive = pulsing("ip")
 
-  const modules: Record<ModuleId, { title: string; sub: string; icon: ComponentType<{ className?: string }>; status: Status }> = {
+  const routes: Record<RouteId, { title: string; sub: string; icon: Icon; color: string; status: Status }> = {
+    veyrix: {
+      title: "Veyrix",
+      sub: running ? "обход включён" : tgOn ? "только Telegram" : "выключен",
+      icon: Waypoints,
+      color: GREEN,
+      status: veyrixOn ? "ok" : "off",
+    },
+    warp: {
+      title: "WARP",
+      sub: ipBlock === "warp" ? (running ? "для блоков по IP" : "обход выключен") : "не выбран",
+      icon: Cloud,
+      color: ORANGE,
+      status: ipOn && ipBlock === "warp" ? "ok" : "off",
+    },
+    socks: {
+      title: "SOCKS5",
+      sub: ipBlock === "proxy" ? props.ipProxy || "адрес не задан" : "не выбран",
+      icon: Server,
+      color: VIOLET,
+      status: ipOn && ipBlock === "proxy" ? "ok" : "off",
+    },
+  }
+
+  const modules: Record<ModuleId, { title: string; sub: string; icon: Icon; status: Status }> = {
     dpi: {
       title: "Обход DPI",
       sub: !running ? "выключен" : props.auto ? "автоподбор приёма" : "приём по умолчанию",
@@ -117,6 +166,12 @@ export function ServiceMap(props: Props) {
       icon: LockKeyhole,
       status: dohOn ? "ok" : "off",
     },
+    ipswap: {
+      title: "Замена адреса",
+      sub: ipOn && ipBlock === "cloudflare" ? "другой адрес Cloudflare" : "не выбрана",
+      icon: Network,
+      status: ipOn && ipBlock === "cloudflare" ? "ok" : "off",
+    },
     tgp: {
       title: "Telegram-прокси",
       sub: tgOn ? `127.0.0.1:${tg?.port} · ${tg?.active ?? 0} соед.` : "выключен",
@@ -125,21 +180,31 @@ export function ServiceMap(props: Props) {
     },
   }
 
+  const out = (col: number, y: number): Point => [COLS[col].x + COLS[col].w, y]
+  const into = (col: number, y: number): Point => [COLS[col].x, y]
   const edges: Edge[] = []
-  const modulePoint = (id: ModuleId, side: "in" | "out"): [number, number] => [
-    side === "in" ? COLS[1].x : COLS[1].x + COLS[1].w,
-    MODULE_Y[id],
-  ]
-  const pcOut: [number, number] = [COLS[0].x + COLS[0].w, PC_Y]
-  const serviceIn = (id: ServiceId): [number, number] => [COLS[2].x, SERVICE_Y[id]]
+  const add = (key: string, from: Point, to: Point, color: string, weight: Edge["weight"]) =>
+    edges.push({ key, from, to, color, weight })
 
-  const pcEdge = (id: ModuleId, on: boolean, key: string) => {
-    if (on) edges.push({ key: `pc-${id}`, from: pcOut, to: modulePoint(id, "in"), color: GREEN, weight: pulsing(key) ? 3 : 1 })
-  }
-  pcEdge("dpi", running, "dpi")
-  pcEdge("quic", quicOn, "quic")
-  pcEdge("doh", dohOn, "doh")
-  pcEdge("tgp", tgOn, "tgp")
+  // Компьютер → путь.
+  const pcOut = out(0, PC_Y)
+  if (veyrixOn) add("pc-veyrix", pcOut, into(1, ROUTE_Y.veyrix), GREEN, w(pulsing("dpi") || pulsing("doh") || pulsing("tgp")))
+  if (routes.warp.status === "ok") add("pc-warp", pcOut, into(1, ROUTE_Y.warp), ORANGE, w(ipLive))
+  if (routes.socks.status === "ok") add("pc-socks", pcOut, into(1, ROUTE_Y.socks), VIOLET, w(ipLive))
+
+  // Veyrix → модули.
+  const vOut = out(1, ROUTE_Y.veyrix)
+  if (running) add("v-dpi", vOut, into(2, MODULE_Y.dpi), GREEN, w(pulsing("dpi")))
+  if (quicOn) add("v-quic", vOut, into(2, MODULE_Y.quic), GREEN, w(pulsing("quic")))
+  if (dohOn) add("v-doh", vOut, into(2, MODULE_Y.doh), GREEN, w(pulsing("doh")))
+  if (modules.ipswap.status === "ok") add("v-ipswap", vOut, into(2, MODULE_Y.ipswap), GREEN, w(ipLive))
+  if (tgOn) add("v-tgp", vOut, into(2, MODULE_Y.tgp), GREEN, w(pulsing("tgp")))
+
+  // Замена адреса, WARP, SOCKS5 → «заблокированы по IP».
+  const blockedIn = into(3, BLOCKED_Y)
+  if (modules.ipswap.status === "ok" && ipBlocked > 0) add("ipswap-b", out(2, MODULE_Y.ipswap), blockedIn, ORANGE, w(ipLive))
+  if (routes.warp.status === "ok" && ipBlocked > 0) add("warp-b", out(1, ROUTE_Y.warp), blockedIn, ORANGE, w(ipLive))
+  if (routes.socks.status === "ok" && ipBlocked > 0) add("socks-b", out(1, ROUTE_Y.socks), blockedIn, VIOLET, w(ipLive))
 
   const serviceStatus: Record<ServiceId, { status: Status; sub: string }> = {} as never
   for (const svc of SERVICES) {
@@ -149,20 +214,14 @@ export function ServiceMap(props: Props) {
     const fresh = (s: MapSite) => s.idleMs < 15_000
     if (running && connections > 0) {
       const live = list.some((s) => s.connections > 0 && fresh(s))
-      edges.push({ key: `dpi-${svc.id}`, from: modulePoint("dpi", "out"), to: serviceIn(svc.id), color: svc.color, weight: live ? 3 : 1 })
+      add(`dpi-${svc.id}`, out(2, MODULE_Y.dpi), into(3, SERVICE_Y[svc.id]), svc.color, w(live))
     }
     if (dohOn && dns > 0) {
       const live = list.some((s) => s.dns > 0 && fresh(s))
-      edges.push({ key: `doh-${svc.id}`, from: modulePoint("doh", "out"), to: serviceIn(svc.id), color: svc.color, weight: live ? 2 : 1 })
+      add(`doh-${svc.id}`, out(2, MODULE_Y.doh), into(3, SERVICE_Y[svc.id]), svc.color, live ? 2 : 1)
     }
     if (svc.id === "telegram" && tgOn) {
-      edges.push({
-        key: "tgp-telegram",
-        from: modulePoint("tgp", "out"),
-        to: serviceIn("telegram"),
-        color: svc.color,
-        weight: pulsing("tgp") ? 3 : 1,
-      })
+      add("tgp-telegram", out(2, MODULE_Y.tgp), into(3, SERVICE_Y.telegram), svc.color, w(pulsing("tgp")))
     }
 
     const switched = list.filter((s) => verdicts[s.site] === "switched")
@@ -202,8 +261,9 @@ export function ServiceMap(props: Props) {
   const uid = useId().replace(/:/g, "")
 
   return (
-    <div ref={field} className="map-field relative min-h-[460px] flex-1 overflow-hidden rounded-[26px] border">
+    <div ref={field} data-tauri-drag-region className="map-field relative min-h-[460px] flex-1 overflow-hidden rounded-[26px] border">
       <div
+        data-tauri-drag-region
         className="absolute top-1/2 left-1/2"
         style={{ width: STAGE.w, height: STAGE.h, transform: `translate(-50%, -46%) scale(${scale})` }}
       >
@@ -218,7 +278,7 @@ export function ServiceMap(props: Props) {
           </div>
         ))}
 
-        <svg className="absolute inset-0 overflow-visible" width={STAGE.w} height={STAGE.h} aria-hidden>
+        <svg data-tauri-drag-region className="absolute inset-0 overflow-visible" width={STAGE.w} height={STAGE.h} aria-hidden>
           <defs>
             <filter id={`${uid}glow`} x="-20%" y="-50%" width="140%" height="200%">
               <feGaussianBlur stdDeviation="3.2" result="b" />
@@ -239,30 +299,50 @@ export function ServiceMap(props: Props) {
           w={COLS[0].w}
           big
           icon={Laptop}
-          title="Этот компьютер"
-          sub={running ? `${total} ${plural(total, "соединение", "соединения", "соединений")}` : "обход выключен"}
+          title="Этот ПК"
+          sub={running ? `${total} соед.` : "обход выключен"}
           status={running ? "ok" : "off"}
         />
+        {(Object.keys(routes) as RouteId[]).map((id) => (
+          <Node key={id} x={COLS[1].x} y={ROUTE_Y[id]} w={COLS[1].w} {...routes[id]} />
+        ))}
         {(Object.keys(modules) as ModuleId[]).map((id) => (
-          <Node key={id} x={COLS[1].x} y={MODULE_Y[id]} w={COLS[1].w} {...modules[id]} />
+          <Node key={id} x={COLS[2].x} y={MODULE_Y[id]} w={COLS[2].w} {...modules[id]} />
         ))}
         {SERVICES.map((svc) => (
           <Node
             key={svc.id}
-            x={COLS[2].x}
+            x={COLS[3].x}
             y={SERVICE_Y[svc.id]}
-            w={COLS[2].w}
+            w={COLS[3].w}
             icon={svc.icon}
             color={svc.color}
             title={svc.title}
             {...serviceStatus[svc.id]}
           />
         ))}
+        <Node
+          x={COLS[3].x}
+          y={BLOCKED_Y}
+          w={COLS[3].w}
+          icon={ShieldAlert}
+          color={ORANGE}
+          title="Блок по IP"
+          sub={
+            ipBlocked > 0
+              ? `${ipBlocked} ${plural(ipBlocked, "адрес", "адреса", "адресов")} · ${ipRerouted} соед.`
+              : ipOn
+                ? "не встречались"
+                : "обход по IP выключен"
+          }
+          status={ipOn && ipBlocked > 0 ? "ok" : "off"}
+        />
       </div>
 
       <div className="absolute bottom-4 left-5 flex gap-5 text-xs font-semibold text-muted-foreground">
         <Legend color={GREEN} text="трафик идёт" />
         <Legend color={AMBER} text="приём сменён автоподбором" />
+        <Legend color={ORANGE} text="обход блокировки по IP" />
         <Legend color="#5d615e" text="выключено или нет соединений" />
       </div>
     </div>
@@ -305,7 +385,7 @@ function Node(props: {
   y: number
   w: number
   big?: boolean
-  icon: ComponentType<{ className?: string }>
+  icon: Icon
   color?: string
   title: string
   sub: string

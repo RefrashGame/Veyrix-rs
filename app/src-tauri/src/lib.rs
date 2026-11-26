@@ -201,12 +201,19 @@ impl Dirs {
     fn settings_file(&self) -> PathBuf {
         self.data.join("settings.json")
     }
+
+    /// Встроенный WARP: программы — `engine\warp\`, аккаунт и профиль — `data\warp\`.
+    fn warp(&self) -> vx_warp::Warp {
+        vx_warp::Warp::new(self.engine.join("warp"), self.data.join("warp"))
+    }
 }
 
 struct AppState {
     dirs: Dirs,
     engine: Mutex<Option<Engine>>,
     telegram: Mutex<Option<vx_tg::Proxy>>,
+    /// Запущенный wireproxy встроенного WARP.
+    warp: Mutex<Option<vx_warp::Process>>,
     /// Запуск из автозапуска: окно не показывается, обход стартует сам.
     autostart: bool,
 }
@@ -303,9 +310,73 @@ fn read_settings(dirs: &Dirs) -> Settings {
     std::fs::read_to_string(dirs.settings_file()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WarpStatus {
+    /// Программы WARP есть рядом с Veyrix.
+    installed: bool,
+    registered: bool,
+    running: bool,
+    port: u16,
+}
+
+fn warp_status_of(state: &AppState) -> WarpStatus {
+    let warp = state.dirs.warp();
+    let running = state.warp.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|p| p.alive());
+    WarpStatus { installed: warp.installed(), registered: warp.registered(), running, port: vx_warp::PORT }
+}
+
+/// Запускает wireproxy, если он ещё не работает (общий для кнопки и для обхода в режиме WARP).
+fn warp_start_with(state: &AppState) -> Result<WarpStatus, String> {
+    {
+        let mut slot = state.warp.lock().map_err(|e| e.to_string())?;
+        if !slot.as_mut().is_some_and(|p| p.alive()) {
+            *slot = Some(state.dirs.warp().start()?);
+        }
+    }
+    Ok(warp_status_of(state))
+}
+
+#[tauri::command]
+fn warp_status(state: State<AppState>) -> WarpStatus {
+    warp_status_of(&state)
+}
+
+/// Регистрация WARP: окно вызывает её только после согласия пользователя с условиями Cloudflare.
+#[tauri::command(async)]
+fn warp_register(state: State<AppState>) -> Result<WarpStatus, String> {
+    state.dirs.warp().register()?;
+    Ok(warp_status_of(&state))
+}
+
+#[tauri::command(async)]
+fn warp_start(state: State<AppState>) -> Result<WarpStatus, String> {
+    warp_start_with(&state)
+}
+
+#[tauri::command(async)]
+fn warp_stop(state: State<AppState>) -> WarpStatus {
+    state.warp.lock().unwrap_or_else(|e| e.into_inner()).take();
+    warp_status_of(&state)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WarpCheck {
+    warp: String,
+    ip: String,
+}
+
+#[tauri::command(async)]
+fn warp_check() -> Result<WarpCheck, String> {
+    vx_warp::check().map(|(warp, ip)| WarpCheck { warp, ip })
+}
+
 /// Запуск обхода — общий для кнопки, трея и автозапуска. Окну сообщается новое состояние (`vx-status`).
 fn start_engine(app: &AppHandle, state: &AppState, settings: &Settings) -> Result<Status, String> {
     let config = settings.config(&state.dirs)?;
+    if settings.ip_block == "warp" {
+        warp_start_with(state)?;
+    }
     if settings.needs_relay() {
         firewall_allow()?;
     }
@@ -525,6 +596,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             }
             "quit" => {
                 stop_engine(app, &state);
+                state.warp.lock().unwrap_or_else(|e| e.into_inner()).take();
                 app.exit(0);
             }
             _ => {}
@@ -621,6 +693,7 @@ pub fn run() {
             dirs: Dirs::near_exe(),
             engine: Mutex::new(None),
             telegram: Mutex::new(None),
+            warp: Mutex::new(None),
             autostart: std::env::args().any(|a| a == AUTOSTART_ARG),
         })
         .invoke_handler(tauri::generate_handler![
@@ -639,6 +712,11 @@ pub fn run() {
             tg_start,
             tg_stop,
             tg_open_link,
+            warp_status,
+            warp_register,
+            warp_start,
+            warp_stop,
+            warp_check,
             window_mode,
             window_minimize,
             window_hide
